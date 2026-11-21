@@ -87,6 +87,15 @@ impl TaskNode {
             .sum()
     }
 
+    /// True when this node has children and 100% of its descendants are Completed.
+    pub fn all_children_completed(&self) -> bool {
+        !self.children.is_empty()
+            && self.children.iter().all(|child| {
+                child.status == TaskStatus::Completed
+                    && (child.children.is_empty() || child.all_children_completed())
+            })
+    }
+
     pub fn count_statuses(&self, counts: &mut StatusCounts) {
         counts.total += 1;
         match self.status {
@@ -258,6 +267,8 @@ pub struct AppData {
     pub months: Vec<MonthBoard>,
     #[serde(default)]
     pub harbor_reports: Vec<HarborReport>,
+    #[serde(default)]
+    pub archived_panes: Vec<MainTaskPane>,
 }
 
 #[cfg(test)]

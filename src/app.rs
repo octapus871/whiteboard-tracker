@@ -10,7 +10,7 @@ use egui::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct WhiteboardApp {
     pub data: AppData,
@@ -46,14 +46,18 @@ pub struct WhiteboardApp {
 
     /// Zero-indexed active page of the paginated 4-pane board.
     pub current_page: usize,
-    /// When true, the full-canvas Master Index view is shown under `BOARD`.
+    /// When true, the full-canvas Master Index view (`INDEX` tab) is shown.
     pub show_master_index: bool,
     /// Draft title input at the top of the Master Index view.
     pub index_new_pane_input: String,
+    /// Pane row currently selected in the Master Index (for Up/Down keyboard reordering & F2 rename).
+    pub index_selected_pane_id: Option<String>,
     /// Pane awaiting a second click ("تأكيد؟") to confirm deletion in Master Index.
     pub index_confirm_delete_pane_id: Option<String>,
     /// Pane whose main title is being inline-edited in the Master Index.
     pub index_editing_pane_id: Option<String>,
+    /// Original title backed up when entering inline rename in Master Index so `Esc` cancels cleanly.
+    pub index_edit_backup_title: Option<String>,
     /// Requests keyboard focus on a Master Index title editor next frame.
     pub index_focus_edit_id: Option<String>,
 
@@ -68,8 +72,11 @@ pub struct WhiteboardApp {
     pub undo_toast: Option<(String, f64)>,
     /// Latest egui frame timestamp for deterministic toast expiration.
     pub last_frame_time: f64,
-    /// Card currently displaying its zero-overlap contextual hover strip.
-    pub hovered_card_id: Option<String>,
+    /// Card currently displaying its sticky contextual hover strip + last active timestamp
+    /// (supports a 180ms grace timer so moving toward `✓ + ≡` never dismisses prematurely).
+    pub last_hovered_card: Option<(String, Instant)>,
+    /// Parent nodes explicitly expanded by the user (immune to auto-collapse).
+    pub manually_expanded_nodes: HashSet<String>,
 
     pub active_mode: AppMode,
     pub dirty: bool,
@@ -79,12 +86,16 @@ pub struct WhiteboardApp {
 #[derive(Debug, Clone)]
 pub struct AppSnapshot {
     pub panes: Vec<MainTaskPane>,
+    pub archived_panes: Vec<MainTaskPane>,
     pub current_page: usize,
 }
 
 const MAX_UNDO_STACK: usize = 30;
 const UNDO_TOAST_DURATION_SECS: f64 = 4.0;
 const MIN_HITBOX_SIZE: f32 = 28.0;
+/// Grace delay before dismissing the contextual hover strip after the pointer leaves
+/// the unified `card_rect.union(strip_rect).expand(4.0)` bridge zone.
+const HOVER_GRACE_DURATION: Duration = Duration::from_millis(180);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMode {
@@ -125,15 +136,18 @@ impl WhiteboardApp {
             current_page: 0,
             show_master_index: false,
             index_new_pane_input: String::new(),
+            index_selected_pane_id: None,
             index_confirm_delete_pane_id: None,
             index_editing_pane_id: None,
+            index_edit_backup_title: None,
             index_focus_edit_id: None,
             pane_note_drawers: HashMap::new(),
             focus_notes_editor: None,
             undo_stack: Vec::new(),
             undo_toast: None,
             last_frame_time: 0.0,
-            hovered_card_id: None,
+            last_hovered_card: None,
+            manually_expanded_nodes: HashSet::new(),
             active_mode: AppMode::LiveBoard,
             dirty: false,
         }
@@ -160,6 +174,7 @@ impl WhiteboardApp {
         }
         self.undo_stack.push(AppSnapshot {
             panes: self.data.current_day.panes.clone(),
+            archived_panes: self.data.archived_panes.clone(),
             current_page: self.current_page,
         });
     }
@@ -171,11 +186,13 @@ impl WhiteboardApp {
             return false;
         };
         self.data.current_day.panes = snapshot.panes;
+        self.data.archived_panes = snapshot.archived_panes;
         self.current_page = snapshot.current_page;
         self.clamp_current_page();
         self.editing_node_id = None;
         self.index_confirm_delete_pane_id = None;
         self.index_editing_pane_id = None;
+        self.index_edit_backup_title = None;
         if let Some(focused_id) = &self.focused_pane_id {
             if !self
                 .data
@@ -330,13 +347,55 @@ impl WhiteboardApp {
             if self.focused_pane_id.as_deref() == Some(removed.id.as_str()) {
                 self.focused_pane_id = None;
             }
+            if self.index_selected_pane_id.as_deref() == Some(removed.id.as_str()) {
+                self.index_selected_pane_id = None;
+            }
             if self.index_confirm_delete_pane_id.as_deref() == Some(removed.id.as_str()) {
                 self.index_confirm_delete_pane_id = None;
             }
             if self.index_editing_pane_id.as_deref() == Some(removed.id.as_str()) {
                 self.index_editing_pane_id = None;
+                self.index_edit_backup_title = None;
             }
             self.clamp_current_page();
+            self.mark_dirty();
+        }
+    }
+
+    /// Archives the main pane at `idx` into Harbor (`archived_panes`) with undo tracking.
+    pub fn archive_pane_at(&mut self, idx: usize, ctx: Option<&egui::Context>) {
+        if idx < self.data.current_day.panes.len() {
+            self.push_undo_snapshot();
+            let archived = self.data.current_day.panes.remove(idx);
+            self.selected_pane_ids.remove(&archived.id);
+            self.pane_inputs.remove(&archived.id);
+            self.close_note_drawer_for_pane(&archived.id, ctx);
+            if self.focused_pane_id.as_deref() == Some(archived.id.as_str()) {
+                self.focused_pane_id = None;
+            }
+            if self.index_selected_pane_id.as_deref() == Some(archived.id.as_str()) {
+                self.index_selected_pane_id = None;
+            }
+            if self.index_confirm_delete_pane_id.as_deref() == Some(archived.id.as_str()) {
+                self.index_confirm_delete_pane_id = None;
+            }
+            if self.index_editing_pane_id.as_deref() == Some(archived.id.as_str()) {
+                self.index_editing_pane_id = None;
+                self.index_edit_backup_title = None;
+            }
+            self.data.archived_panes.push(archived);
+            self.clamp_current_page();
+            self.mark_dirty();
+        }
+    }
+
+    /// Restores an archived pane from Harbor back to the live board.
+    pub fn restore_archived_pane(&mut self, idx: usize) {
+        if idx < self.data.archived_panes.len() {
+            self.push_undo_snapshot();
+            let pane = self.data.archived_panes.remove(idx);
+            self.data.current_day.panes.push(pane);
+            self.current_page = (self.data.current_day.panes.len() - 1) / PANES_PER_PAGE;
             self.mark_dirty();
         }
     }
@@ -480,11 +539,14 @@ impl WhiteboardApp {
     // ---------------------------------------------------------------------
 
     fn handle_keyboard_navigation(&mut self, ctx: &egui::Context) {
-        if self.show_quick_entry_modal || ctx.wants_keyboard_input() {
+        if self.show_quick_entry_modal {
             return;
         }
 
-        // Page navigation shortcuts: PageUp / PageDown and Alt+Left / Alt+Right.
+        // On HOME, PageUp / PageDown and Alt+Left / Alt+Right flip pages immediately
+        // from anywhere (even while the live bottom branch input retains focus), as
+        // long as a card title isn't actively being renamed inline.
+        let on_home = self.active_mode == AppMode::LiveBoard && !self.show_master_index;
         let (page_up, page_down, alt_left, alt_right) = ctx.input(|i| {
             (
                 i.key_pressed(Key::PageUp),
@@ -493,6 +555,21 @@ impl WhiteboardApp {
                 i.modifiers.alt && i.key_pressed(Key::ArrowRight),
             )
         });
+        if on_home && self.editing_node_id.is_none() {
+            if page_up || alt_left {
+                self.prev_page();
+                return;
+            }
+            if page_down || alt_right {
+                self.next_page();
+                return;
+            }
+        }
+
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+
         if page_up || alt_left {
             self.prev_page();
             return;
@@ -642,6 +719,7 @@ impl WhiteboardApp {
         let new_id = new_node.id.clone();
         let snapshot = AppSnapshot {
             panes: self.data.current_day.panes.clone(),
+            archived_panes: self.data.archived_panes.clone(),
             current_page: self.current_page,
         };
         for pane in &mut self.data.current_day.panes {
@@ -661,6 +739,7 @@ impl WhiteboardApp {
         let new_id = new_node.id.clone();
         let snapshot = AppSnapshot {
             panes: self.data.current_day.panes.clone(),
+            archived_panes: self.data.archived_panes.clone(),
             current_page: self.current_page,
         };
         for pane in &mut self.data.current_day.panes {
@@ -678,6 +757,7 @@ impl WhiteboardApp {
     fn outdent_node(&mut self, target_id: &str) -> Option<String> {
         let snapshot = AppSnapshot {
             panes: self.data.current_day.panes.clone(),
+            archived_panes: self.data.archived_panes.clone(),
             current_page: self.current_page,
         };
         for pane in &mut self.data.current_day.panes {
@@ -702,6 +782,7 @@ impl WhiteboardApp {
         let snapshot = if record_undo {
             Some(AppSnapshot {
                 panes: self.data.current_day.panes.clone(),
+                archived_panes: self.data.archived_panes.clone(),
                 current_page: self.current_page,
             })
         } else {
@@ -723,6 +804,7 @@ impl WhiteboardApp {
                     self.editing_node_id = None;
                 }
                 self.pane_note_drawers.retain(|_, v| v != target_id);
+                self.manually_expanded_nodes.remove(target_id);
                 if self.focus_notes_editor.as_deref() == Some(target_id) {
                     self.focus_notes_editor = None;
                 }
@@ -831,8 +913,18 @@ impl WhiteboardApp {
             if self.show_quick_entry_modal {
                 self.show_quick_entry_modal = false;
                 self.focus_quick_entry = false;
-            } else if self.index_editing_pane_id.is_some() {
-                self.index_editing_pane_id = None;
+            } else if let Some(edit_id) = self.index_editing_pane_id.take() {
+                if let Some(backup) = self.index_edit_backup_title.take() {
+                    if let Some(pane) = self
+                        .data
+                        .current_day
+                        .panes
+                        .iter_mut()
+                        .find(|p| p.id == edit_id)
+                    {
+                        pane.title = backup;
+                    }
+                }
             } else if self.index_confirm_delete_pane_id.is_some() {
                 self.index_confirm_delete_pane_id = None;
             } else if self.show_master_index {
@@ -940,7 +1032,8 @@ impl WhiteboardApp {
 }
 
 impl WhiteboardApp {
-    /// Ultra-minimalist single-line top bar: `BOARD | HARBOR` on the left,
+    /// Ultra-minimalist single-line top bar: explicit `HOME | INDEX | HARBOR` tabs
+    /// on the left (crisp `2.0px` `#0F172A` active underline, single-click immediate),
     /// centered `‹ PAGE 1 / N ›` page navigator, and clock + window controls on
     /// the right, over a 1px black hairline.
     fn render_top_bar(&mut self, ui: &mut Ui) {
@@ -948,45 +1041,80 @@ impl WhiteboardApp {
         let bar_rect = ui.max_rect();
         let total_pages = self.total_pages();
 
-        // Background drag region across the frameless top bar (interactive controls sit on top).
+        // Background drag region sits behind interactive controls; only starts a
+        // window drag if no interactive top-bar control is hovered so single clicks
+        // on `HOME`, `INDEX`, `HARBOR`, `‹`, `›` always fire immediately.
         let drag_response = ui.interact(bar_rect, ui.id().with("top_bar_drag"), Sense::drag());
-        if drag_response.drag_started() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
+        let mut any_control_hovered = false;
+        let mut surrender_focus = false;
 
-        // Left navigation: `BOARD | HARBOR` (or `← BACK [Esc]` when maximized).
+        // Left navigation: `HOME | INDEX | HARBOR` (or `← BACK [Esc]` when maximized).
         let left_rect = Rect::from_min_max(
             bar_rect.left_top(),
-            pos2((bar_rect.center().x - 95.0).max(bar_rect.left() + 140.0), bar_rect.bottom()),
+            pos2(
+                (bar_rect.center().x - 108.0).max(bar_rect.left() + 240.0),
+                bar_rect.bottom(),
+            ),
         );
         let mut left_ui = ui.new_child(
             UiBuilder::new()
                 .max_rect(left_rect)
                 .layout(Layout::left_to_right(Align::Center)),
         );
-        left_ui.spacing_mut().item_spacing.x = 12.0;
+        left_ui.spacing_mut().item_spacing.x = 6.0;
         if self.focused_pane_id.is_some() {
-            if text_link(&mut left_ui, "← BACK [Esc]", true).clicked() {
+            let back_resp = top_bar_tab(&mut left_ui, "← BACK [Esc]", true);
+            any_control_hovered |= back_resp.hovered();
+            if back_resp.clicked() {
                 self.focused_pane_id = None;
+                surrender_focus = true;
             }
         } else {
-            if text_link(&mut left_ui, "BOARD", self.active_mode == AppMode::LiveBoard)
-                .on_hover_text("TOGGLE MASTER INDEX / BOARD")
-                .clicked()
-            {
-                if self.active_mode == AppMode::LiveBoard {
-                    self.show_master_index = !self.show_master_index;
-                    self.index_confirm_delete_pane_id = None;
-                    self.index_editing_pane_id = None;
-                } else {
-                    self.active_mode = AppMode::LiveBoard;
-                    self.show_master_index = false;
-                }
+            let home_active = self.active_mode == AppMode::LiveBoard && !self.show_master_index;
+            let index_active = self.active_mode == AppMode::LiveBoard && self.show_master_index;
+            let harbor_active = self.active_mode == AppMode::Harbor;
+
+            let home_resp = top_bar_tab(&mut left_ui, "HOME", home_active)
+                .on_hover_text("ACTIVE 4-PANE BOARD");
+            any_control_hovered |= home_resp.hovered();
+            if home_resp.clicked() {
+                self.active_mode = AppMode::LiveBoard;
+                self.show_master_index = false;
+                self.focused_pane_id = None;
+                self.index_confirm_delete_pane_id = None;
+                self.index_editing_pane_id = None;
+                self.index_edit_backup_title = None;
+                surrender_focus = true;
             }
-            left_ui.label(mono("|", 14.0).color(theme::DIVIDER));
-            if text_link(&mut left_ui, "HARBOR", self.active_mode == AppMode::Harbor).clicked() {
+
+            left_ui.label(mono("|", 13.0).color(theme::DIVIDER));
+
+            let index_resp = top_bar_tab(&mut left_ui, "INDEX", index_active)
+                .on_hover_text("MASTER INDEX");
+            any_control_hovered |= index_resp.hovered();
+            if index_resp.clicked() {
+                self.active_mode = AppMode::LiveBoard;
+                self.show_master_index = true;
+                self.focused_pane_id = None;
+                self.index_confirm_delete_pane_id = None;
+                self.index_editing_pane_id = None;
+                self.index_edit_backup_title = None;
+                surrender_focus = true;
+            }
+
+            left_ui.label(mono("|", 13.0).color(theme::DIVIDER));
+
+            let harbor_resp = top_bar_tab(&mut left_ui, "HARBOR", harbor_active)
+                .on_hover_text("ARCHIVE & REPORTS");
+            any_control_hovered |= harbor_resp.hovered();
+            if harbor_resp.clicked() {
                 self.active_mode = AppMode::Harbor;
                 self.show_master_index = false;
+                self.focused_pane_id = None;
+                self.index_confirm_delete_pane_id = None;
+                self.index_editing_pane_id = None;
+                self.index_edit_backup_title = None;
+                surrender_focus = true;
             }
         }
 
@@ -1014,6 +1142,7 @@ impl WhiteboardApp {
                 let prev_resp = prev_resp
                     .on_hover_cursor(CursorIcon::PointingHand)
                     .on_hover_text("PREVIOUS PAGE [PageUp / Alt+Left]");
+                any_control_hovered |= prev_resp.hovered();
                 let prev_color = if can_prev { theme::INK } else { theme::MUTED };
                 ui.painter().text(
                     prev_rect.center(),
@@ -1024,6 +1153,7 @@ impl WhiteboardApp {
                 );
                 if prev_resp.clicked() && can_prev {
                     self.prev_page();
+                    surrender_focus = true;
                 }
 
                 ui.label(
@@ -1042,6 +1172,7 @@ impl WhiteboardApp {
                 let next_resp = next_resp
                     .on_hover_cursor(CursorIcon::PointingHand)
                     .on_hover_text("NEXT PAGE [PageDown / Alt+Right]");
+                any_control_hovered |= next_resp.hovered();
                 let next_color = if can_next { theme::INK } else { theme::MUTED };
                 ui.painter().text(
                     next_rect.center(),
@@ -1052,13 +1183,14 @@ impl WhiteboardApp {
                 );
                 if next_resp.clicked() && can_next {
                     self.next_page();
+                    surrender_focus = true;
                 }
             });
         });
 
         // Right cluster: window controls + digital clock.
         let right_rect = Rect::from_min_max(
-            pos2((bar_rect.center().x + 95.0).min(bar_rect.right() - 180.0), bar_rect.top()),
+            pos2((bar_rect.center().x + 108.0).min(bar_rect.right() - 180.0), bar_rect.top()),
             bar_rect.right_bottom(),
         );
         let mut right_ui = ui.new_child(
@@ -1067,14 +1199,20 @@ impl WhiteboardApp {
                 .layout(Layout::right_to_left(Align::Center)),
         );
         right_ui.spacing_mut().item_spacing.x = 12.0;
-        if window_control(&mut right_ui, "\u{d7}", "CLOSE").clicked() {
+        let close_btn = window_control(&mut right_ui, "\u{d7}", "CLOSE");
+        any_control_hovered |= close_btn.hovered();
+        if close_btn.clicked() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if window_control(&mut right_ui, "\u{25a1}", "MAXIMIZE").clicked() {
+        let max_btn = window_control(&mut right_ui, "\u{25a1}", "MAXIMIZE");
+        any_control_hovered |= max_btn.hovered();
+        if max_btn.clicked() {
             let maximized = ctx.input(|i| i.viewport().maximized).unwrap_or(false);
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
         }
-        if window_control(&mut right_ui, "\u{2014}", "MINIMIZE").clicked() {
+        let min_btn = window_control(&mut right_ui, "\u{2014}", "MINIMIZE");
+        any_control_hovered |= min_btn.hovered();
+        if min_btn.clicked() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
         right_ui.add_space(10.0);
@@ -1082,6 +1220,17 @@ impl WhiteboardApp {
         let short_date = short_date_string();
         right_ui.label(mono(&time, 14.0).strong().color(theme::INK));
         right_ui.label(mono(short_date, 12.5).color(theme::SLATE));
+
+        if drag_response.drag_started() && !any_control_hovered {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if surrender_focus {
+            ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+        }
 
         // 1px black hairline separating the strip from the board.
         let rule = Rect::from_min_max(
@@ -1251,8 +1400,9 @@ impl WhiteboardApp {
     /// Full-canvas Swiss architectural Master Index view (`#FFFFFF`, `0.0px`):
     /// lists only main pane titles grouped into pages of 4 separated by `2.0px`
     /// solid `#0F172A` dividers (`PAGE 01`, `PAGE 02`, ...), with inline add,
-    /// 2-click delete confirmation, `↑`/`↓` reordering, `[P1]`/`[P2]` page
-    /// cycling, and title editing.
+    /// row selection + Up/Down keyboard reordering across pages, F2 / double-click /
+    /// `تعديل` inline RTL rename (`Enter` saves, `Esc` cancels), `أرشفة`, and
+    /// 2-click `حذف` confirmation.
     fn render_master_index(&mut self, ui: &mut Ui) {
         let full_rect = ui.max_rect();
         ui.painter()
@@ -1262,21 +1412,60 @@ impl WhiteboardApp {
         let mut move_up: Option<usize> = None;
         let mut move_down: Option<usize> = None;
         let mut move_next_page: Option<usize> = None;
+        let mut archive_idx: Option<usize> = None;
         let mut delete_idx: Option<usize> = None;
         let mut add_title: Option<String> = None;
         let mut focus_add_input = false;
+        let mut start_edit: Option<(String, String)> = None;
+        let mut commit_edit = false;
         let mut dirty = false;
+
+        let ctx = ui.ctx().clone();
+
+        // Keyboard controls when a row is selected in INDEX (and no TextEdit is active):
+        // Up / Down moves the selected main task across pages; F2 starts inline rename;
+        // Enter opens that pane's page on HOME.
+        if !ctx.wants_keyboard_input() && self.index_editing_pane_id.is_none() {
+            if let Some(sel_id) = self.index_selected_pane_id.clone() {
+                if let Some(sel_idx) = self
+                    .data
+                    .current_day
+                    .panes
+                    .iter()
+                    .position(|p| p.id == sel_id)
+                {
+                    let (key_up, key_down, key_f2, key_enter) = ctx.input(|i| {
+                        let no_mod = !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.command;
+                        (
+                            no_mod && i.key_pressed(Key::ArrowUp),
+                            no_mod && i.key_pressed(Key::ArrowDown),
+                            no_mod && i.key_pressed(Key::F2),
+                            no_mod && i.key_pressed(Key::Enter),
+                        )
+                    });
+                    if key_up && sel_idx > 0 {
+                        move_up = Some(sel_idx);
+                    } else if key_down && sel_idx + 1 < self.data.current_day.panes.len() {
+                        move_down = Some(sel_idx);
+                    } else if key_f2 {
+                        let backup = self.data.current_day.panes[sel_idx].title.clone();
+                        start_edit = Some((sel_id, backup));
+                    } else if key_enter {
+                        open_page = Some(sel_idx / PANES_PER_PAGE);
+                    }
+                }
+            }
+        }
 
         let total_pages = self.total_pages();
         let pane_count = self.data.current_day.panes.len();
-        let ctx = ui.ctx().clone();
 
         ScrollArea::vertical()
             .id_salt("master_index_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let avail_w = ui.available_width();
-                let content_w = (avail_w - 64.0).clamp(320.0, 900.0);
+                let content_w = (avail_w - 64.0).clamp(360.0, 920.0);
                 let side_pad = ((avail_w - content_w) * 0.5).max(16.0);
 
                 ui.add_space(24.0);
@@ -1386,251 +1575,279 @@ impl WhiteboardApp {
                                     let pane = &mut self.data.current_day.panes[idx];
                                     let pane_id = pane.id.clone();
                                     let (done, total) = count_pane_progress(&pane.subtasks);
-                                    let is_editing =
-                                        self.index_editing_pane_id.as_deref() == Some(pane_id.as_str());
+                                    let is_selected = self.index_selected_pane_id.as_deref()
+                                        == Some(pane_id.as_str());
+                                    let is_editing = self.index_editing_pane_id.as_deref()
+                                        == Some(pane_id.as_str());
                                     let is_confirming_del = self
                                         .index_confirm_delete_pane_id
                                         .as_deref()
                                         == Some(pane_id.as_str());
 
-                                    rtl_row(ui, 46.0, |ui| {
-                                        ui.spacing_mut().item_spacing.x = 10.0;
-
-                                        // Rightmost: monospace index `[0N]`.
-                                        ui.label(
-                                            mono(format!("[{:02}]", idx + 1), 14.0)
-                                                .strong()
-                                                .color(theme::INK_SOFT),
+                                    let row_w = ui.available_width();
+                                    let (row_rect, row_bg_resp) =
+                                        ui.allocate_exact_size(vec2(row_w, 46.0), Sense::click());
+                                    if is_selected {
+                                        ui.painter().rect_filled(
+                                            row_rect,
+                                            CornerRadius::same(0),
+                                            theme::SEL_FILL,
                                         );
+                                        ui.painter().rect_stroke(
+                                            row_rect,
+                                            CornerRadius::same(0),
+                                            Stroke::new(1.5, theme::INK),
+                                            StrokeKind::Inside,
+                                        );
+                                    }
+                                    if row_bg_resp.clicked() {
+                                        self.index_selected_pane_id = Some(pane_id.clone());
+                                        self.index_confirm_delete_pane_id = None;
+                                    }
 
-                                        // Title region: clickable 18.0px Bold title (opens page) or inline RTL TextEdit.
-                                        let controls_w = if is_confirming_del { 292.0 } else { 248.0 };
-                                        let title_w = (ui.available_width() - controls_w).max(120.0);
+                                    let row_inner = row_rect.shrink2(vec2(8.0, 2.0));
+                                    let mut row_ui = ui.new_child(
+                                        UiBuilder::new()
+                                            .max_rect(row_inner)
+                                            .layout(Layout::right_to_left(Align::Center)),
+                                    );
+                                    row_ui.set_clip_rect(row_inner);
+                                    row_ui.spacing_mut().item_spacing.x = 10.0;
 
-                                        if is_editing {
-                                            let edit_resp = rtl_text_edit(
-                                                ui,
-                                                Id::new(("index_pane_title_edit", pane_id.as_str())),
-                                                &mut pane.title,
-                                                "اسم المهمة...",
-                                                18.0,
-                                                title_w,
-                                                Margin::symmetric(6, 4),
-                                                theme::INK,
-                                            )
-                                            .response;
-                                            if self.index_focus_edit_id.as_deref()
-                                                == Some(pane_id.as_str())
-                                            {
-                                                edit_resp.request_focus();
-                                                self.index_focus_edit_id = None;
-                                            }
-                                            if edit_resp.changed() {
-                                                dirty = true;
-                                            }
-                                            let finish = edit_resp.lost_focus()
-                                                || ((edit_resp.has_focus()
-                                                    || edit_resp.lost_focus())
-                                                    && ui.input(|i| i.key_pressed(Key::Enter)));
-                                            if finish {
-                                                self.index_editing_pane_id = None;
-                                            }
-                                        } else {
-                                            let title_display = if pane.title.trim().is_empty() {
-                                                shape_arabic("بدون عنوان")
-                                            } else {
-                                                shape_arabic(&pane.title)
-                                            };
-                                            let title_resp = ui
-                                                .add_sized(
-                                                    vec2(title_w, 34.0),
-                                                    Label::new(
-                                                        RichText::new(title_display)
-                                                            .size(18.0)
-                                                            .strong()
-                                                            .color(theme::INK),
-                                                    )
-                                                    .selectable(false)
-                                                    .sense(Sense::click())
-                                                    .halign(Align::Max)
-                                                    .truncate(),
-                                                )
-                                                .on_hover_cursor(CursorIcon::PointingHand)
-                                                .on_hover_text("CLICK: OPEN PAGE");
-                                            if title_resp.clicked() {
-                                                open_page = Some(page_idx);
-                                            }
+                                    // Rightmost: monospace index `[0N]`.
+                                    row_ui.label(
+                                        mono(format!("[{:02}]", idx + 1), 14.0)
+                                            .strong()
+                                            .color(theme::INK_SOFT),
+                                    );
+
+                                    // Title region: single-click selects row, double-click edits inline.
+                                    let controls_w = if is_confirming_del { 356.0 } else { 340.0 };
+                                    let title_w = (row_ui.available_width() - controls_w).max(100.0);
+
+                                    if is_editing {
+                                        let edit_resp = rtl_text_edit(
+                                            &mut row_ui,
+                                            Id::new(("index_pane_title_edit", pane_id.as_str())),
+                                            &mut pane.title,
+                                            "اسم المهمة...",
+                                            18.0,
+                                            title_w,
+                                            Margin::symmetric(6, 4),
+                                            theme::INK,
+                                        )
+                                        .response;
+                                        if self.index_focus_edit_id.as_deref()
+                                            == Some(pane_id.as_str())
+                                        {
+                                            edit_resp.request_focus();
+                                            self.index_focus_edit_id = None;
                                         }
+                                        if edit_resp.changed() {
+                                            dirty = true;
+                                        }
+                                        let enter_pressed = (edit_resp.has_focus()
+                                            || edit_resp.lost_focus())
+                                            && row_ui.input(|i| i.key_pressed(Key::Enter));
+                                        if enter_pressed || edit_resp.lost_focus() {
+                                            commit_edit = true;
+                                        }
+                                    } else {
+                                        let title_display = if pane.title.trim().is_empty() {
+                                            shape_arabic("بدون عنوان")
+                                        } else {
+                                            shape_arabic(&pane.title)
+                                        };
+                                        let title_resp = row_ui
+                                            .add_sized(
+                                                vec2(title_w, 34.0),
+                                                Label::new(
+                                                    RichText::new(title_display)
+                                                        .size(18.0)
+                                                        .strong()
+                                                        .color(theme::INK),
+                                                )
+                                                .selectable(false)
+                                                .sense(Sense::click())
+                                                .halign(Align::Max)
+                                                .truncate(),
+                                            )
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .on_hover_text(
+                                                "CLICK: SELECT · DOUBLE-CLICK / F2: RENAME · UP/DOWN: REORDER · ENTER: OPEN PAGE",
+                                            );
+                                        if title_resp.double_clicked() {
+                                            self.index_selected_pane_id = Some(pane_id.clone());
+                                            self.index_confirm_delete_pane_id = None;
+                                            start_edit =
+                                                Some((pane_id.clone(), pane.title.clone()));
+                                        } else if title_resp.clicked() {
+                                            self.index_selected_pane_id = Some(pane_id.clone());
+                                            self.index_confirm_delete_pane_id = None;
+                                        }
+                                    }
 
-                                        // Left-aligned controls cluster.
-                                        ui.with_layout(
-                                            Layout::left_to_right(Align::Center),
-                                            |ui| {
-                                                ui.spacing_mut().item_spacing.x = 6.0;
+                                    // Left-aligned controls cluster (100% valid text/vector icons, >=28px hitboxes).
+                                    row_ui.with_layout(
+                                        Layout::left_to_right(Align::Center),
+                                        |ui| {
+                                            ui.spacing_mut().item_spacing.x = 6.0;
 
-                                                // 1. Delete (`✕` -> 2-click confirm `"تأكيد؟"`).
-                                                if is_confirming_del {
-                                                    let confirm_resp = Frame::new()
-                                                        .fill(theme::RED_BAR)
-                                                        .corner_radius(CornerRadius::same(0))
-                                                        .inner_margin(Margin::symmetric(8, 3))
-                                                        .show(ui, |ui| {
-                                                            ui.add(
-                                                                Label::new(
-                                                                    RichText::new(shape_arabic(
-                                                                        "تأكيد؟",
-                                                                    ))
-                                                                    .size(13.0)
-                                                                    .strong()
-                                                                    .color(theme::PANE),
-                                                                )
-                                                                .selectable(false)
-                                                                .sense(Sense::click()),
-                                                            )
-                                                            .on_hover_cursor(
-                                                                CursorIcon::PointingHand,
-                                                            )
-                                                        })
-                                                        .inner;
-                                                    if confirm_resp.clicked() {
-                                                        delete_idx = Some(idx);
-                                                    }
-                                                } else {
-                                                    let (del_rect, del_resp) =
-                                                        ui.allocate_exact_size(
-                                                            vec2(MIN_HITBOX_SIZE, MIN_HITBOX_SIZE),
-                                                            Sense::click(),
-                                                        );
-                                                    let del_resp = del_resp
-                                                        .on_hover_cursor(CursorIcon::PointingHand)
-                                                        .on_hover_text("DELETE PANE");
-                                                    let del_color = if del_resp.hovered() {
-                                                        theme::RED_BAR
-                                                    } else {
-                                                        theme::SLATE
-                                                    };
-                                                    ui.painter().text(
-                                                        del_rect.center(),
-                                                        egui::Align2::CENTER_CENTER,
-                                                        "✕",
-                                                        FontId::monospace(14.0),
-                                                        del_color,
-                                                    );
-                                                    if del_resp.clicked() {
-                                                        self.index_confirm_delete_pane_id =
-                                                            Some(pane_id.clone());
-                                                    }
-                                                }
-
-                                                // 2. Inline title edit toggle (`✎`, 28x28 hitbox).
-                                                let (edit_rect, edit_btn) = ui.allocate_exact_size(
-                                                    vec2(MIN_HITBOX_SIZE, MIN_HITBOX_SIZE),
-                                                    Sense::click(),
-                                                );
-                                                let edit_btn = edit_btn
-                                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                                    .on_hover_text("EDIT TITLE");
-                                                let edit_color = if is_editing || edit_btn.hovered()
-                                                {
-                                                    theme::INK
-                                                } else {
-                                                    theme::SLATE
-                                                };
-                                                ui.painter().text(
-                                                    edit_rect.center(),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    "✎",
-                                                    FontId::proportional(14.0),
-                                                    edit_color,
-                                                );
-                                                if edit_btn.clicked() {
-                                                    self.index_confirm_delete_pane_id = None;
-                                                    if is_editing {
-                                                        self.index_editing_pane_id = None;
-                                                    } else {
-                                                        self.index_editing_pane_id =
-                                                            Some(pane_id.clone());
-                                                        self.index_focus_edit_id =
-                                                            Some(pane_id.clone());
-                                                    }
-                                                }
-
-                                                // 3. Reorder up (`↑`) and down (`↓`, 28x28 hitbox).
-                                                let can_up = idx > 0;
-                                                let can_down = idx + 1 < pane_count;
-
-                                                let up_resp = index_icon_button(ui, "↑", can_up)
-                                                    .on_hover_text("MOVE UP");
-                                                if up_resp.clicked() && can_up {
-                                                    move_up = Some(idx);
-                                                    self.index_confirm_delete_pane_id = None;
-                                                }
-
-                                                let down_resp =
-                                                    index_icon_button(ui, "↓", can_down)
-                                                        .on_hover_text("MOVE DOWN");
-                                                if down_resp.clicked() && can_down {
-                                                    move_down = Some(idx);
-                                                    self.index_confirm_delete_pane_id = None;
-                                                }
-
-                                                // 4. Page assignment badge `[P1]` / `[P2]`
-                                                // (compact visual box inside a generous >=28px hitbox).
-                                                let p_badge = format!("[P{}]", page_idx + 1);
-                                                let (hit_rect, badge_resp) =
+                                            // 1. Delete (`حذف` -> 2-click confirm `"تأكيد؟"`).
+                                            if is_confirming_del {
+                                                let (confirm_rect, confirm_resp) =
                                                     ui.allocate_exact_size(
-                                                        vec2(40.0, MIN_HITBOX_SIZE),
+                                                        vec2(54.0, MIN_HITBOX_SIZE),
                                                         Sense::click(),
                                                     );
-                                                let badge_resp = badge_resp
-                                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                                    .on_hover_text("MOVE TO NEXT PAGE");
-                                                let visual_badge = Rect::from_center_size(
-                                                    hit_rect.center(),
-                                                    vec2(38.0, 22.0),
+                                                let confirm_resp = confirm_resp
+                                                    .on_hover_cursor(CursorIcon::PointingHand);
+                                                let pill = Rect::from_center_size(
+                                                    confirm_rect.center(),
+                                                    vec2(52.0, 22.0),
                                                 );
-                                                let badge_bg = if badge_resp.hovered() {
-                                                    theme::HINT
-                                                } else {
-                                                    theme::SEL_FILL
-                                                };
                                                 ui.painter().rect_filled(
-                                                    visual_badge,
+                                                    pill,
                                                     CornerRadius::same(0),
-                                                    badge_bg,
-                                                );
-                                                ui.painter().rect_stroke(
-                                                    visual_badge,
-                                                    CornerRadius::same(0),
-                                                    Stroke::new(theme::HAIRLINE, theme::INK),
-                                                    StrokeKind::Inside,
+                                                    theme::RED_BAR,
                                                 );
                                                 ui.painter().text(
-                                                    visual_badge.center(),
+                                                    pill.center(),
                                                     egui::Align2::CENTER_CENTER,
-                                                    &p_badge,
-                                                    FontId::monospace(12.5),
-                                                    theme::INK,
+                                                    shape_arabic("تأكيد؟"),
+                                                    FontId::proportional(12.5),
+                                                    theme::PANE,
                                                 );
-                                                if badge_resp.clicked() {
-                                                    move_next_page = Some(idx);
-                                                    self.index_confirm_delete_pane_id = None;
+                                                if confirm_resp.clicked() {
+                                                    delete_idx = Some(idx);
                                                 }
+                                            } else {
+                                                let del_resp = index_text_action(
+                                                    ui,
+                                                    "حذف",
+                                                    38.0,
+                                                    theme::SLATE,
+                                                    theme::RED_BAR,
+                                                )
+                                                .on_hover_text("DELETE PANE");
+                                                if del_resp.clicked() {
+                                                    self.index_selected_pane_id =
+                                                        Some(pane_id.clone());
+                                                    self.index_confirm_delete_pane_id =
+                                                        Some(pane_id.clone());
+                                                }
+                                            }
 
-                                                // 5. Completion badge (`done/total`).
-                                                let done_color = if total > 0 && done == total {
-                                                    theme::GREEN_BAR
+                                            // 2. Archive (`أرشفة` -> moves pane to Harbor archive).
+                                            let arch_resp = index_text_action(
+                                                ui,
+                                                "أرشفة",
+                                                46.0,
+                                                theme::SLATE,
+                                                theme::INK,
+                                            )
+                                            .on_hover_text("ARCHIVE TO HARBOR");
+                                            if arch_resp.clicked() {
+                                                self.index_confirm_delete_pane_id = None;
+                                                archive_idx = Some(idx);
+                                            }
+
+                                            // 3. Inline rename (`تعديل`, >=28px tall hitbox).
+                                            let edit_btn = index_text_action(
+                                                ui,
+                                                "تعديل",
+                                                44.0,
+                                                if is_editing { theme::INK } else { theme::SLATE },
+                                                theme::INK,
+                                            )
+                                            .on_hover_text("RENAME [F2]");
+                                            if edit_btn.clicked() {
+                                                self.index_selected_pane_id = Some(pane_id.clone());
+                                                self.index_confirm_delete_pane_id = None;
+                                                if is_editing {
+                                                    commit_edit = true;
                                                 } else {
-                                                    theme::INK_SOFT
-                                                };
-                                                ui.label(
-                                                    mono(format!("{}/{}", done, total), 13.5)
-                                                        .strong()
-                                                        .color(done_color),
-                                                );
-                                            },
-                                        );
-                                    });
+                                                    start_edit =
+                                                        Some((pane_id.clone(), pane.title.clone()));
+                                                }
+                                            }
+
+                                            // 4. Reorder up (`↑`) and down (`↓`, painter-drawn vectors, 28x28 hitboxes).
+                                            let can_up = idx > 0;
+                                            let can_down = idx + 1 < pane_count;
+
+                                            let up_resp = index_arrow_button(ui, true, can_up)
+                                                .on_hover_text("MOVE UP [Up]");
+                                            if up_resp.clicked() && can_up {
+                                                self.index_selected_pane_id = Some(pane_id.clone());
+                                                move_up = Some(idx);
+                                                self.index_confirm_delete_pane_id = None;
+                                            }
+
+                                            let down_resp = index_arrow_button(ui, false, can_down)
+                                                .on_hover_text("MOVE DOWN [Down]");
+                                            if down_resp.clicked() && can_down {
+                                                self.index_selected_pane_id = Some(pane_id.clone());
+                                                move_down = Some(idx);
+                                                self.index_confirm_delete_pane_id = None;
+                                            }
+
+                                            // 5. Page assignment badge `[P1]` / `[P2]`
+                                            // (compact visual box inside a generous >=28px hitbox).
+                                            let p_badge = format!("[P{}]", page_idx + 1);
+                                            let (hit_rect, badge_resp) = ui.allocate_exact_size(
+                                                vec2(40.0, MIN_HITBOX_SIZE),
+                                                Sense::click(),
+                                            );
+                                            let badge_resp = badge_resp
+                                                .on_hover_cursor(CursorIcon::PointingHand)
+                                                .on_hover_text("MOVE TO NEXT PAGE");
+                                            let visual_badge = Rect::from_center_size(
+                                                hit_rect.center(),
+                                                vec2(38.0, 22.0),
+                                            );
+                                            let badge_bg = if badge_resp.hovered() {
+                                                theme::HINT
+                                            } else {
+                                                theme::SEL_FILL
+                                            };
+                                            ui.painter().rect_filled(
+                                                visual_badge,
+                                                CornerRadius::same(0),
+                                                badge_bg,
+                                            );
+                                            ui.painter().rect_stroke(
+                                                visual_badge,
+                                                CornerRadius::same(0),
+                                                Stroke::new(theme::HAIRLINE, theme::INK),
+                                                StrokeKind::Inside,
+                                            );
+                                            ui.painter().text(
+                                                visual_badge.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                &p_badge,
+                                                FontId::monospace(12.5),
+                                                theme::INK,
+                                            );
+                                            if badge_resp.clicked() {
+                                                self.index_selected_pane_id = Some(pane_id.clone());
+                                                move_next_page = Some(idx);
+                                                self.index_confirm_delete_pane_id = None;
+                                            }
+
+                                            // 6. Completion badge (`done/total`).
+                                            let done_color = if total > 0 && done == total {
+                                                theme::GREEN_BAR
+                                            } else {
+                                                theme::INK_SOFT
+                                            };
+                                            ui.label(
+                                                mono(format!("{}/{}", done, total), 13.5)
+                                                    .strong()
+                                                    .color(done_color),
+                                            );
+                                        },
+                                    );
 
                                     // Crisp 1.0px subtle row separator between panes inside a page.
                                     if idx + 1 < end {
@@ -1653,6 +1870,14 @@ impl WhiteboardApp {
                 });
             });
 
+        if let Some((pane_id, backup_title)) = start_edit {
+            self.index_editing_pane_id = Some(pane_id.clone());
+            self.index_edit_backup_title = Some(backup_title);
+            self.index_focus_edit_id = Some(pane_id);
+        } else if commit_edit {
+            self.index_editing_pane_id = None;
+            self.index_edit_backup_title = None;
+        }
         if dirty {
             self.mark_dirty();
         }
@@ -1672,6 +1897,9 @@ impl WhiteboardApp {
         if let Some(idx) = move_next_page {
             self.move_pane_to_next_page(idx);
         }
+        if let Some(idx) = archive_idx {
+            self.archive_pane_at(idx, Some(&ctx));
+        }
         if let Some(idx) = delete_idx {
             self.delete_pane_at(idx, Some(&ctx));
         }
@@ -1681,26 +1909,96 @@ impl WhiteboardApp {
             self.focused_pane_id = None;
             self.index_confirm_delete_pane_id = None;
             self.index_editing_pane_id = None;
+            self.index_edit_backup_title = None;
         }
     }
 
     fn render_harbor_placeholder(&mut self, ui: &mut Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(50.0);
-            Frame::new()
-                .fill(theme::PANE)
-                .stroke(Stroke::new(theme::GRID_LINE, theme::GRID))
-                .corner_radius(CornerRadius::same(theme::CARD_RADIUS))
-                .inner_margin(Margin::same(28))
-                .show(ui, |ui| {
-                    ui.label(mono("HARBOR", 20.0).strong());
-                    ui.add_space(6.0);
-                    ui.label(
-                        mono("REPORTS & PERSISTENT ARCHIVE ARRIVE IN PHASE FOUR.", 11.0)
-                            .color(theme::TEXT_MUTED),
+        let full_rect = ui.max_rect();
+        ui.painter()
+            .rect_filled(full_rect, CornerRadius::same(0), theme::PANE);
+
+        if self.data.archived_panes.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(50.0);
+                Frame::new()
+                    .fill(theme::PANE)
+                    .stroke(Stroke::new(theme::GRID_LINE, theme::GRID))
+                    .corner_radius(CornerRadius::same(theme::CARD_RADIUS))
+                    .inner_margin(Margin::same(28))
+                    .show(ui, |ui| {
+                        ui.label(mono("HARBOR", 20.0).strong());
+                        ui.add_space(6.0);
+                        ui.label(
+                            mono("NO ARCHIVED PANES YET.", 12.0).color(theme::TEXT_MUTED),
+                        );
+                    });
+            });
+            return;
+        }
+
+        let mut restore_idx: Option<usize> = None;
+        ScrollArea::vertical()
+            .id_salt("harbor_archive_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let avail_w = ui.available_width();
+                let content_w = (avail_w - 64.0).clamp(320.0, 860.0);
+                let side_pad = ((avail_w - content_w) * 0.5).max(16.0);
+                ui.add_space(24.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(side_pad);
+                    ui.allocate_ui_with_layout(
+                        vec2(content_w, 0.0),
+                        Layout::top_down(Align::Max),
+                        |ui| {
+                            ui.set_min_width(content_w);
+                            ui.label(mono("HARBOR", 18.0).strong().color(theme::INK));
+                            ui.add_space(8.0);
+                            let (rule, _) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), 2.0),
+                                Sense::hover(),
+                            );
+                            ui.painter()
+                                .rect_filled(rule, CornerRadius::same(0), theme::INK);
+                            ui.add_space(8.0);
+
+                            for (idx, pane) in self.data.archived_panes.iter().enumerate() {
+                                let (done, total) = count_pane_progress(&pane.subtasks);
+                                rtl_row(ui, 42.0, |ui| {
+                                    ui.label(
+                                        RichText::new(shape_arabic(&pane.title))
+                                            .size(16.0)
+                                            .strong()
+                                            .color(theme::INK),
+                                    );
+                                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                        let r = index_text_action(
+                                            ui,
+                                            "استعادة",
+                                            56.0,
+                                            theme::INK_SOFT,
+                                            theme::INK,
+                                        )
+                                        .on_hover_text("RESTORE TO BOARD");
+                                        if r.clicked() {
+                                            restore_idx = Some(idx);
+                                        }
+                                        ui.label(
+                                            mono(format!("{}/{}", done, total), 13.0)
+                                                .color(theme::SLATE),
+                                        );
+                                    });
+                                });
+                            }
+                        },
                     );
                 });
-        });
+            });
+
+        if let Some(idx) = restore_idx {
+            self.restore_archived_pane(idx);
+        }
     }
 
     fn render_daily_canvas(&mut self, ui: &mut Ui) {
@@ -1797,7 +2095,19 @@ impl WhiteboardApp {
                 }
 
                 let origin = canvas_rect.min;
-                let prev_hovered_card = self.hovered_card_id.clone();
+                let now = Instant::now();
+                let prev_hovered_card: Option<String> = if self.is_zen || self.editing_node_id.is_some()
+                {
+                    None
+                } else {
+                    self.last_hovered_card.as_ref().and_then(|(id, since)| {
+                        if now.saturating_duration_since(*since) < HOVER_GRACE_DURATION {
+                            Some(id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                };
                 for tile in placements {
                     let pane_idx = tile.pane_idx;
                     let tile_rect = Rect::from_min_size(origin + tile.pos.to_vec2(), tile.size);
@@ -1819,6 +2129,7 @@ impl WhiteboardApp {
                         input,
                         open_drawer_node_id.as_deref(),
                         prev_hovered_card.as_deref(),
+                        &mut self.manually_expanded_nodes,
                         &mut self.focus_notes_editor,
                         &mut self.focused_pane_id,
                         &mut self.focused_node_id,
@@ -1853,7 +2164,20 @@ impl WhiteboardApp {
                 }
             });
 
-        self.hovered_card_id = actions.next_hovered_card;
+        let hover_now = Instant::now();
+        if self.is_zen || self.editing_node_id.is_some() {
+            self.last_hovered_card = None;
+        } else if let Some(active_id) = actions.next_hovered_card {
+            self.last_hovered_card = Some((active_id, hover_now));
+        } else if let Some((_, since)) = &self.last_hovered_card {
+            let elapsed = hover_now.saturating_duration_since(*since);
+            if elapsed >= HOVER_GRACE_DURATION {
+                self.last_hovered_card = None;
+            } else {
+                ui.ctx()
+                    .request_repaint_after(HOVER_GRACE_DURATION - elapsed);
+            }
+        }
 
         if actions.dirty {
             self.dirty = true;
@@ -1962,15 +2286,17 @@ struct PaneActions {
 
 /// Expands `visual_rect` symmetrically so its invisible hit target is at least
 /// `28.0 × 28.0` while preserving compact painted geometry.
+#[allow(dead_code)]
 fn min_hitbox(visual_rect: Rect) -> Rect {
     let w = visual_rect.width().max(MIN_HITBOX_SIZE);
     let h = visual_rect.height().max(MIN_HITBOX_SIZE);
     Rect::from_center_size(visual_rect.center(), vec2(w, h))
 }
 
-/// Crisp `0.0px` icon button used for `↑` / `↓` row reordering in the Master Index.
-/// Allocates a generous `28.0 × 28.0` hitbox while painting a compact `22.0 × 22.0` visual box.
-fn index_icon_button(ui: &mut Ui, glyph: &str, enabled: bool) -> egui::Response {
+/// Crisp `0.0px` painter-drawn vector arrow button (`up = true` for `↑`, `false`
+/// for `↓`) used for row reordering in `INDEX`. Never relies on Unicode arrow
+/// font glyphs and allocates a generous `28.0 × 28.0` hitbox.
+fn index_arrow_button(ui: &mut Ui, up: bool, enabled: bool) -> egui::Response {
     let (hit_rect, resp) =
         ui.allocate_exact_size(vec2(MIN_HITBOX_SIZE, MIN_HITBOX_SIZE), Sense::click());
     let resp = if enabled {
@@ -2000,12 +2326,53 @@ fn index_icon_button(ui: &mut Ui, glyph: &str, enabled: bool) -> egui::Response 
         Stroke::new(theme::HAIRLINE, border),
         StrokeKind::Inside,
     );
+    let c = visual_rect.center();
+    let stroke = Stroke::new(1.4, fg);
+    // Vertical shaft + crisp V arrowhead.
+    ui.painter()
+        .line_segment([pos2(c.x, c.y - 4.5), pos2(c.x, c.y + 4.5)], stroke);
+    if up {
+        ui.painter()
+            .line_segment([pos2(c.x, c.y - 4.5), pos2(c.x - 3.5, c.y - 1.0)], stroke);
+        ui.painter()
+            .line_segment([pos2(c.x, c.y - 4.5), pos2(c.x + 3.5, c.y - 1.0)], stroke);
+    } else {
+        ui.painter()
+            .line_segment([pos2(c.x, c.y + 4.5), pos2(c.x - 3.5, c.y + 1.0)], stroke);
+        ui.painter()
+            .line_segment([pos2(c.x, c.y + 4.5), pos2(c.x + 3.5, c.y + 1.0)], stroke);
+    }
+    resp
+}
+
+/// Crisp Arabic text action button (`حذف`, `أرشفة`, `تعديل`, `استعادة`) with a
+/// generous `>=28px`-tall hitbox and zero missing-glyph boxes.
+fn index_text_action(
+    ui: &mut Ui,
+    label: &str,
+    width: f32,
+    idle_color: Color32,
+    hover_color: Color32,
+) -> egui::Response {
+    let (hit_rect, resp) =
+        ui.allocate_exact_size(vec2(width.max(MIN_HITBOX_SIZE), MIN_HITBOX_SIZE), Sense::click());
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    if resp.hovered() {
+        let pill = Rect::from_center_size(hit_rect.center(), vec2(width, 22.0));
+        ui.painter()
+            .rect_filled(pill, CornerRadius::same(0), theme::SEL_FILL);
+    }
+    let color = if resp.hovered() {
+        hover_color
+    } else {
+        idle_color
+    };
     ui.painter().text(
-        visual_rect.center(),
+        hit_rect.center(),
         egui::Align2::CENTER_CENTER,
-        glyph,
-        FontId::monospace(13.0),
-        fg,
+        shape_arabic(label),
+        FontId::proportional(13.0),
+        color,
     );
     resp
 }
@@ -2154,6 +2521,7 @@ fn render_mind_map(
     pane_input: &mut String,
     open_drawer_node_id: Option<&str>,
     prev_hovered_card: Option<&str>,
+    manually_expanded_nodes: &mut HashSet<String>,
     focus_notes_editor: &mut Option<String>,
     focused_pane_id: &mut Option<String>,
     focused_node_id: &mut Option<String>,
@@ -2168,7 +2536,7 @@ fn render_mind_map(
         .filter(|id| find_node_in_slice_mut(&mut pane.subtasks, id).is_some())
         .map(str::to_string);
 
-    let (top_rect, drawer_rect) = if valid_drawer_id.is_some() {
+    let (top_rect, drawer_rect, drawer_h) = if valid_drawer_id.is_some() {
         let drawer_h = (rect.height() * 0.38)
             .max(96.0)
             .min((rect.height() - 120.0).max(96.0));
@@ -2176,9 +2544,10 @@ fn render_mind_map(
         (
             Rect::from_min_max(rect.min, pos2(rect.right(), split_y)),
             Some(Rect::from_min_max(pos2(rect.left(), split_y), rect.max)),
+            drawer_h,
         )
     } else {
-        (rect, None)
+        (rect, None, 0.0)
     };
 
     let mut child = ui.new_child(UiBuilder::new().max_rect(top_rect));
@@ -2190,8 +2559,10 @@ fn render_mind_map(
         is_selected,
         zen,
         focus,
+        drawer_h,
         pane_input,
         prev_hovered_card,
+        manually_expanded_nodes,
         focused_pane_id,
         focused_node_id,
         editing_node_id,
@@ -2365,9 +2736,9 @@ fn render_pane_note_drawer(
         }
         close_response.on_hover_text("CLOSE NOTES [Esc]");
 
-        // 2. Crisp Copy button (`COPY` + subtle clipboard icon, >=28px tall hitbox).
+        // 2. Crisp Copy button (clean text `COPY` / `COPIED`, zero missing-glyph icon, >=28px hitbox).
         let copy_label = if show_copied { "COPIED" } else { "COPY" };
-        let copy_w = if show_copied { 58.0 } else { 52.0 };
+        let copy_w = if show_copied { 52.0 } else { 42.0 };
         let (copy_rect, copy_response) =
             ui.allocate_exact_size(vec2(copy_w, MIN_HITBOX_SIZE), Sense::click());
         let copy_response = copy_response
@@ -2385,25 +2756,9 @@ fn render_pane_note_drawer(
             ui.painter()
                 .rect_filled(pill, CornerRadius::same(0), theme::SEL_FILL);
         }
-        // Minimal 9x10 vector clipboard icon on the left of `COPY`.
-        let icon_origin = pos2(copy_rect.left() + 4.0, copy_rect.center().y - 5.0);
-        ui.painter().rect_stroke(
-            Rect::from_min_size(icon_origin + vec2(2.0, 2.0), vec2(7.0, 8.0)),
-            CornerRadius::same(0),
-            Stroke::new(1.1, copy_color),
-            StrokeKind::Inside,
-        );
-        ui.painter().line_segment(
-            [icon_origin, pos2(icon_origin.x + 6.0, icon_origin.y)],
-            Stroke::new(1.1, copy_color),
-        );
-        ui.painter().line_segment(
-            [icon_origin, pos2(icon_origin.x, icon_origin.y + 7.0)],
-            Stroke::new(1.1, copy_color),
-        );
         ui.painter().text(
-            pos2(copy_rect.left() + 15.0, copy_rect.center().y),
-            egui::Align2::LEFT_CENTER,
+            copy_rect.center(),
+            egui::Align2::CENTER_CENTER,
             copy_label,
             FontId::monospace(11.5),
             copy_color,
@@ -2428,27 +2783,25 @@ fn render_pane_note_drawer(
         .painter()
         .rect_filled(div_rect, CornerRadius::same(0), theme::SUBTLE_RULE);
 
-    // Frameless distraction-free RTL writing canvas (`16.0px` inner padding, `16.0px` font).
+    // Frameless distraction-free RTL writing canvas (`16.0px` inner padding, `16.0px` font):
+    // Arabic starts flush against the right `16.0px` padding, flows naturally right-to-left,
+    // and places the caret accurately without mutating the logical `node.notes` buffer.
     let body_h = card_ui.available_height().max(32.0);
     ScrollArea::vertical()
         .id_salt(("pane_drawer_scroll", pane_id, node_id.as_str()))
         .auto_shrink([false, false])
         .max_height(body_h)
         .show(&mut card_ui, |ui| {
-            let margin = Margin::same(16);
-            let mut layouter = rtl_multiline_layouter(16.0);
-            let editor_output = TextEdit::multiline(&mut node.notes)
-                .id(Id::new(("pane_notes_editor", node_id.as_str())))
-                .font(FontId::proportional(16.0))
-                .desired_width(f32::INFINITY)
-                .desired_rows(4)
-                .frame(false)
-                .margin(margin)
-                .background_color(theme::DRAWER_BG)
-                .text_color(theme::INK)
-                .horizontal_align(Align::RIGHT)
-                .layouter(&mut layouter)
-                .show(ui);
+            let editor_output = rtl_multiline_text_edit(
+                ui,
+                Id::new(("pane_notes_editor", node_id.as_str())),
+                &mut node.notes,
+                "اكتب ملاحظاتك هنا...",
+                16.0,
+                Margin::same(16),
+                theme::DRAWER_BG,
+                theme::INK,
+            );
 
             if focus_notes_editor.as_deref() == Some(node_id.as_str()) {
                 editor_output.response.request_focus();
@@ -2456,18 +2809,6 @@ fn render_pane_note_drawer(
             }
             if editor_output.response.changed() {
                 actions.dirty = true;
-            }
-            if node.notes.is_empty() && !editor_output.response.has_focus() {
-                let inner = editor_output.response.rect - margin;
-                let anchor = pos2(inner.right(), inner.top());
-                let painter = ui.painter_at(editor_output.text_clip_rect.expand(1.0));
-                painter.text(
-                    anchor,
-                    egui::Align2::RIGHT_TOP,
-                    shape_arabic("اكتب ملاحظاتك هنا..."),
-                    FontId::proportional(16.0),
-                    theme::MUTED,
-                );
             }
         });
 }
@@ -2483,8 +2824,10 @@ fn render_pane(
     is_selected: bool,
     zen: bool,
     _focus: bool,
+    drawer_h: f32,
     pane_input: &mut String,
     prev_hovered_card: Option<&str>,
+    manually_expanded_nodes: &mut HashSet<String>,
     focused_pane_id: &mut Option<String>,
     focused_node_id: &mut Option<String>,
     editing_node_id: &mut Option<String>,
@@ -2707,6 +3050,36 @@ fn render_pane(
     let editing_snap = editing_node_id.clone();
 
     let single_base = mind_map_metrics_for_density(avail_w, total);
+
+    // Predictable, non-jumping auto-collapse policy:
+    // Never collapse active/in-progress trees or while the user is editing a
+    // node in this pane. Auto-collapse ONLY parent groups whose descendants
+    // are 100% Completed when the pane exceeds its available vertical height
+    // (unless the user manually expanded that group).
+    let editing_in_pane = editing_snap
+        .as_deref()
+        .is_some_and(|id| find_node_in_slice_mut(&mut pane.subtasks, id).is_some());
+    if !editing_in_pane {
+        let initial_h = stack_height(
+            &body_ui,
+            &pane.subtasks,
+            &single_base,
+            0,
+            editing_snap.as_deref(),
+        );
+        if initial_h + DENSE_TOP_MARGIN + SHADOW_OFFSET.y + BOTTOM_SCROLL_PAD > avail_h {
+            if auto_collapse_completed_groups(
+                &body_ui,
+                &mut pane.subtasks,
+                &single_base,
+                avail_h,
+                manually_expanded_nodes,
+            ) {
+                actions.dirty = true;
+            }
+        }
+    }
+
     let single_unscaled_h = stack_height(
         &body_ui,
         &pane.subtasks,
@@ -2714,20 +3087,31 @@ fn render_pane(
         0,
         editing_snap.as_deref(),
     );
+    let bottom_clearance = SHADOW_OFFSET.y + BOTTOM_SCROLL_PAD;
     let needs_two_cols =
-        pane.subtasks.len() >= 2 && (single_unscaled_h + DENSE_TOP_MARGIN + SHADOW_PAD) > avail_h;
+        pane.subtasks.len() >= 2 && (single_unscaled_h + DENSE_TOP_MARGIN + bottom_clearance) > avail_h;
 
     let mut hover_controls = Vec::new();
+    let mut fold_handles = Vec::new();
 
     if needs_two_cols {
         // Automatic height-balanced 2-column split (Right Half 50% | Left Half 50%)
-        // separated by a crisp 1.0px #E2E8F0 vertical hairline spanning from just
-        // below the pane header hairline to the top edge of the bottom input strip.
-        const SPLIT_COL_GAP: f32 = 16.0;
-        let half_w = ((avail_w - SPLIT_COL_GAP) * 0.5).max(80.0);
+        // with a crisp 1.0px #E2E8F0 center vertical divider and an 8.0px inner margin
+        // on both sides (16.0px total gutter). Each column is strictly clipped to its
+        // own half-pane rect and owns an independent vertical ScrollArea with full
+        // bottom shadow (3.0px) + 12.0px bottom padding clearance.
         let mid_x = tree_rect.center().x;
+        let right_col_rect = Rect::from_min_max(
+            pos2(mid_x + SPLIT_COL_GUTTER, tree_rect.top()),
+            tree_rect.right_bottom(),
+        );
+        let left_col_rect = Rect::from_min_max(
+            tree_rect.left_top(),
+            pos2(mid_x - SPLIT_COL_GUTTER, tree_rect.bottom()),
+        );
+        let half_w = right_col_rect.width().min(left_col_rect.width()).max(80.0);
 
-        let half_base = mind_map_metrics_for_density(half_w, total);
+        let half_base = mind_map_metrics_for_split_col(half_w, total);
         // Compute each root group's actual half-column subtree pixel height for packing.
         let root_heights: Vec<f32> = pane
             .subtasks
@@ -2756,7 +3140,7 @@ fn render_pane(
             let lh = stack_height(&body_ui, left_slice, &metrics, 0, editing_snap.as_deref());
             let rw = stack_width(&body_ui, right_slice, &metrics, 0, editing_snap.as_deref());
             let lw = stack_width(&body_ui, left_slice, &metrics, 0, editing_snap.as_deref());
-            let req_h = rh.max(lh) + DENSE_TOP_MARGIN + SHADOW_PAD;
+            let req_h = rh.max(lh) + DENSE_TOP_MARGIN + bottom_clearance;
             let req_w = rw.max(lw) + SHADOW_PAD;
             let scale = fit_scale(req_h, req_w, avail_h, half_w);
             if (scale - 1.0).abs() < 0.005 {
@@ -2769,71 +3153,77 @@ fn render_pane(
         let (right_nodes, left_nodes) = pane.subtasks.split_at_mut(split_idx);
         let right_h = stack_height(&body_ui, right_nodes, &metrics, 0, editing_snap.as_deref());
         let left_h = stack_height(&body_ui, left_nodes, &metrics, 0, editing_snap.as_deref());
-        let content_h = (right_h.max(left_h) + DENSE_TOP_MARGIN + SHADOW_PAD).max(avail_h);
+        let right_content_h = (right_h + DENSE_TOP_MARGIN + bottom_clearance).max(avail_h);
+        let left_content_h = (left_h + DENSE_TOP_MARGIN + bottom_clearance).max(avail_h);
 
-        // Clipped ScrollArea safety net above the 38.0px bottom input strip so no card is half-clipped.
+        // Right Column: strictly clipped to `right_col_rect` with its own vertical ScrollArea.
+        let mut right_col_ui = body_ui.new_child(UiBuilder::new().max_rect(right_col_rect));
+        right_col_ui.set_clip_rect(right_col_rect);
         ScrollArea::vertical()
-            .id_salt(("pane_scroll_2col", pane.id.as_str()))
+            .id_salt(("pane_scroll_2col_r", pane.id.as_str()))
             .auto_shrink([false, false])
             .max_height(avail_h)
-            .show(&mut body_ui, |ui| {
-                ui.set_min_width(avail_w);
-                ui.set_min_height(content_h);
-                let scroll_rect = Rect::from_min_size(ui.max_rect().min, vec2(avail_w, content_h));
-                let local_mid_x = scroll_rect.center().x;
-
-                let right_rect = Rect::from_min_max(
-                    pos2(local_mid_x + SPLIT_COL_GAP * 0.5, scroll_rect.top()),
-                    scroll_rect.right_bottom(),
-                );
-                let left_rect = Rect::from_min_max(
-                    scroll_rect.left_top(),
-                    pos2(local_mid_x - SPLIT_COL_GAP * 0.5, scroll_rect.bottom()),
-                );
-
-                let mut right_ui = ui.new_child(UiBuilder::new().max_rect(right_rect));
-                right_ui.set_clip_rect(right_rect.intersect(tree_rect));
+            .show(&mut right_col_ui, |ui| {
+                ui.set_clip_rect(right_col_rect);
+                let col_w = right_col_rect.width();
+                let (content_rect, _) =
+                    ui.allocate_exact_size(vec2(col_w, right_content_h), Sense::hover());
                 render_mind_map_nodes(
-                    &mut right_ui,
+                    ui,
                     right_nodes,
                     0,
                     0,
                     DENSE_TOP_MARGIN + right_h * 0.5,
-                    right_rect.width() - 2.0,
-                    right_rect.min.x,
-                    right_rect.min.y,
+                    col_w - 2.0,
+                    content_rect.min.x,
+                    content_rect.min.y,
                     &metrics,
                     zen,
                     hover_clamp_rect,
                     prev_hovered_card,
+                    manually_expanded_nodes,
                     focused_node_id,
                     editing_node_id,
                     request_focus_id,
                     selected_node_ids,
                     &mut hover_controls,
+                    &mut fold_handles,
                     actions,
                 );
+            });
 
-                let mut left_ui = ui.new_child(UiBuilder::new().max_rect(left_rect));
-                left_ui.set_clip_rect(left_rect.intersect(tree_rect));
+        // Left Column: strictly clipped to `left_col_rect` with its own vertical ScrollArea.
+        let mut left_col_ui = body_ui.new_child(UiBuilder::new().max_rect(left_col_rect));
+        left_col_ui.set_clip_rect(left_col_rect);
+        ScrollArea::vertical()
+            .id_salt(("pane_scroll_2col_l", pane.id.as_str()))
+            .auto_shrink([false, false])
+            .max_height(avail_h)
+            .show(&mut left_col_ui, |ui| {
+                ui.set_clip_rect(left_col_rect);
+                let col_w = left_col_rect.width();
+                let (content_rect, _) =
+                    ui.allocate_exact_size(vec2(col_w, left_content_h), Sense::hover());
                 render_mind_map_nodes(
-                    &mut left_ui,
+                    ui,
                     left_nodes,
                     0,
                     split_idx,
                     DENSE_TOP_MARGIN + left_h * 0.5,
-                    left_rect.width() - 2.0,
-                    left_rect.min.x,
-                    left_rect.min.y,
+                    col_w - 2.0,
+                    content_rect.min.x,
+                    content_rect.min.y,
                     &metrics,
                     zen,
                     hover_clamp_rect,
                     prev_hovered_card,
+                    manually_expanded_nodes,
                     focused_node_id,
                     editing_node_id,
                     request_focus_id,
                     selected_node_ids,
                     &mut hover_controls,
+                    &mut fold_handles,
                     actions,
                 );
             });
@@ -2843,8 +3233,8 @@ fn render_pane(
         for _ in 0..3 {
             let req_h = (stack_height(&body_ui, &pane.subtasks, &metrics, 0, editing_snap.as_deref())
                 + DENSE_TOP_MARGIN
-                + SHADOW_PAD)
-                .max(metrics.min_card_h + DENSE_TOP_MARGIN + SHADOW_PAD);
+                + bottom_clearance)
+                .max(metrics.min_card_h + DENSE_TOP_MARGIN + bottom_clearance);
             let req_w =
                 stack_width(&body_ui, &pane.subtasks, &metrics, 0, editing_snap.as_deref())
                     + SHADOW_PAD;
@@ -2860,13 +3250,20 @@ fn render_pane(
             stack_width(&body_ui, &pane.subtasks, &metrics, 0, editing_snap.as_deref()) + SHADOW_PAD;
         let tree_h =
             stack_height(&body_ui, &pane.subtasks, &metrics, 0, editing_snap.as_deref());
-        let content_h = (tree_h + DENSE_TOP_MARGIN + SHADOW_PAD).max(avail_h);
+        let content_h = (tree_h + DENSE_TOP_MARGIN + bottom_clearance).max(avail_h);
         let overflow_x = (content_w - avail_w).max(0.0);
-        let is_sparse = total <= 7 && tree_h <= avail_h * 0.72;
+        let unshrunk_avail_h = avail_h + drawer_h;
+        let is_sparse = total <= 7 && tree_h <= unshrunk_avail_h * 0.72;
+        let min_center = DENSE_TOP_MARGIN + tree_h * 0.5;
         let block_center_y = if is_sparse {
-            (avail_h * 0.5).max(DENSE_TOP_MARGIN + tree_h * 0.5)
+            // Optical upper-middle center computed against the unshrunk pane height so
+            // opening the bottom note card on Click 1 never jumps cards out from under
+            // the cursor before Click 2 of a double-click rename.
+            let preferred = (unshrunk_avail_h * 0.34).max(min_center);
+            let max_center = (avail_h - bottom_clearance - tree_h * 0.5).max(min_center);
+            preferred.min(max_center)
         } else {
-            DENSE_TOP_MARGIN + tree_h * 0.5
+            min_center
         };
 
         // Clipped ScrollArea safety net above the 38.0px bottom input strip.
@@ -2880,9 +3277,9 @@ fn render_pane(
         }
         area.show(&mut body_ui, |ui| {
             let total_w = avail_w.max(content_w);
-            ui.set_min_width(total_w);
-            ui.set_min_height(content_h);
-            let origin = ui.max_rect().min;
+            let (content_rect, _) =
+                ui.allocate_exact_size(vec2(total_w, content_h), Sense::hover());
+            let origin = content_rect.min;
             render_mind_map_nodes(
                 ui,
                 &mut pane.subtasks,
@@ -2896,11 +3293,13 @@ fn render_pane(
                 zen,
                 hover_clamp_rect,
                 prev_hovered_card,
+                manually_expanded_nodes,
                 focused_node_id,
                 editing_node_id,
                 request_focus_id,
                 selected_node_ids,
                 &mut hover_controls,
+                &mut fold_handles,
                 actions,
             );
         });
@@ -2909,10 +3308,21 @@ fn render_pane(
         }
     }
 
-    // Paint clamped contextual hover strip last over the pane rect so neither
-    // Bezier ink curves nor inner tree clip boundaries ever cut it off.
+    // Paint fold handles cleanly over Bezier origins strictly inside each handle's
+    // own column clip rect, then paint the sticky contextual hover strip on top.
+    paint_fold_handles(ui, &fold_handles);
+
+    let has_direct_hover = hover_controls.iter().any(|c| c.is_direct_hover);
+    let visible_controls: Vec<HoverControl> = if has_direct_hover {
+        hover_controls
+            .into_iter()
+            .filter(|c| c.is_direct_hover)
+            .collect()
+    } else {
+        hover_controls
+    };
     let strip_painter = ui.painter_at(pane_outer_rect);
-    paint_hover_controls(&strip_painter, &hover_controls);
+    paint_hover_controls(&strip_painter, &visible_controls);
 
     // Render dedicated 38.0px bottom input strip (`#FFFFFF`, `1.0px` `#E2E8F0` top border).
     if let Some(strip_rect) = input_strip_rect {
@@ -2960,30 +3370,256 @@ fn rtl_layouter(
                 ..Default::default()
             },
         );
-        ui.fonts_mut(|fonts| fonts.layout_job(job))
+        let mut galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+        // `epaint` lays out `Align::RIGHT` rows in `[-max_w, 0.0]`, while `egui::TextEdit`
+        // with `.horizontal_align(Align::RIGHT)` offsets `galley_pos.x` by `inner.right() - galley.size().x`.
+        // Shifting rows by `-galley.rect.min.x` puts the galley in `[0.0, max_w]` so every
+        // line's right edge aligns pixel-exact flush against the right 16.0px padding!
+        let shift_x = -galley.rect.min.x;
+        if shift_x > 0.0 {
+            let g = Arc::make_mut(&mut galley);
+            for row in &mut g.rows {
+                row.pos.x += shift_x;
+            }
+            g.rect = g.rect.translate(vec2(shift_x, 0.0));
+            g.mesh_bounds = g.mesh_bounds.translate(vec2(shift_x, 0.0));
+        }
+        galley
     }
 }
 
-/// Multiline RTL layouter for the architectural notes modal: shapes Arabic
-/// per line and right-aligns wrapped lines while keeping logical char counts.
-fn rtl_multiline_layouter(
+/// Wraps and shapes a multiline logical buffer for an RTL `TextEdit` while
+/// strictly preserving a 1-to-1 character count (`output.chars().count() ==
+/// input.chars().count()`): any wrapping ASCII space inside an Arabic paragraph
+/// is replaced by `'\n'` so lines flow top-to-bottom in natural reading order
+/// without mutating the underlying logical string or breaking cursor indices.
+fn shape_multiline_for_editor(
+    ui: &Ui,
+    text: &str,
+    font_id: &FontId,
+    wrap_width: f32,
+) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let max_w = wrap_width.max(48.0);
+    let measure_w = |segment: &str| -> f32 {
+        let shaped = shape_arabic(segment);
+        ui.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(shaped, font_id.clone(), Color32::TRANSPARENT)
+                .size()
+                .x
+        })
+    };
+
+    let mut out = String::with_capacity(text.len() * 2);
+    let paragraphs: Vec<&str> = text.split('\n').collect();
+    for (p_idx, para) in paragraphs.iter().enumerate() {
+        if p_idx > 0 {
+            out.push('\n');
+        }
+        if para.is_empty() {
+            continue;
+        }
+        if !crate::rtl_text::contains_arabic(para) || measure_w(para) <= max_w {
+            out.push_str(&shape_arabic(para));
+            continue;
+        }
+        // Greedy line wrap preserving exact character positions: each wrapping
+        // ASCII space becomes `\n`, keeping 1-to-1 char count alignment.
+        let mut line_start = 0usize;
+        let mut last_space: Option<usize> = None;
+        for (byte_idx, ch) in para.char_indices() {
+            if ch == ' ' {
+                let candidate = &para[line_start..byte_idx];
+                if !candidate.is_empty() && measure_w(candidate) > max_w {
+                    if let Some(sp) = last_space {
+                        out.push_str(&shape_arabic(&para[line_start..sp]));
+                        out.push('\n');
+                        line_start = sp + 1;
+                    }
+                }
+                last_space = Some(byte_idx);
+            }
+        }
+        let rem = &para[line_start..];
+        if !rem.is_empty() && measure_w(rem) > max_w {
+            if let Some(sp) = last_space {
+                if sp >= line_start {
+                    out.push_str(&shape_arabic(&para[line_start..sp]));
+                    out.push('\n');
+                    line_start = sp + 1;
+                }
+            }
+        }
+        out.push_str(&shape_arabic(&para[line_start..]));
+    }
+    out
+}
+
+/// Maps a logical character index in `logical_text` to its visual character
+/// index in `visual_text` (produced by [`shape_multiline_for_editor`]).
+fn rtl_multiline_visual_cursor_index(
+    logical_text: &str,
+    visual_text: &str,
+    logical_idx: usize,
+) -> usize {
+    let logical_chars: Vec<char> = logical_text.chars().collect();
+    let total = logical_chars.len();
+    let clamped = logical_idx.min(total);
+    let mut line_start = 0usize;
+    for vis_line in visual_text.split('\n') {
+        let line_len = vis_line.chars().count();
+        let line_end = (line_start + line_len).min(total);
+        if clamped <= line_end {
+            let col = clamped.saturating_sub(line_start);
+            let slice_str: String = logical_chars[line_start..line_end].iter().collect();
+            let slice_has_arabic = crate::rtl_text::contains_arabic(&slice_str);
+            let visual_col = if slice_has_arabic {
+                line_len.saturating_sub(col)
+            } else {
+                col
+            };
+            return line_start + visual_col;
+        }
+        line_start = line_end + 1;
+    }
+    clamped
+}
+
+/// Frameless multiline RTL `TextEdit` for the architectural note card:
+/// * Keeps the mutable `text` buffer purely logical UTF-8 (never mutates with bidi).
+/// * Aligns every line flush against the right padding (`16.0px`).
+/// * Paints an accurate blinking RTL caret at the true visual leading edge on Arabic lines.
+#[allow(clippy::too_many_arguments)]
+fn rtl_multiline_text_edit(
+    ui: &mut Ui,
+    id: Id,
+    text: &mut String,
+    hint: &str,
     font_size: f32,
-) -> impl FnMut(&Ui, &dyn egui::TextBuffer, f32) -> Arc<Galley> {
-    move |ui, text, wrap_width| {
+    margin: Margin,
+    bg_color: Color32,
+    text_color: Color32,
+) -> egui::text_edit::TextEditOutput {
+    let has_arabic = crate::rtl_text::contains_arabic(text);
+    let prev_cursor = ui.visuals().text_cursor.clone();
+    if has_arabic {
+        // Suppress egui's default LTR caret when editing Arabic so we can paint
+        // the true RTL leading-edge caret cleanly.
+        ui.visuals_mut().text_cursor.stroke = Stroke::NONE;
+        ui.visuals_mut().text_cursor.preview = false;
+    }
+
+    let font = FontId::proportional(font_size);
+    let mut shaped_snapshot = String::new();
+    let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+        let shaped = shape_multiline_for_editor(ui, buf.as_str(), &font, wrap_width);
+        shaped_snapshot = shaped.clone();
         let mut job = egui::text::LayoutJob::default();
         job.wrap.max_width = wrap_width;
         job.halign = Align::RIGHT;
         job.append(
-            &shape_arabic(text.as_str()),
+            &shaped,
             0.0,
             egui::TextFormat {
-                font_id: egui::FontId::proportional(font_size),
-                color: theme::INK,
+                font_id: font.clone(),
+                color: text_color,
                 ..Default::default()
             },
         );
-        ui.fonts_mut(|fonts| fonts.layout_job(job))
+        let mut galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+        // `epaint` lays out `Align::RIGHT` rows in `[-max_w, 0.0]`, while `egui::TextEdit`
+        // with `.horizontal_align(Align::RIGHT)` offsets `galley_pos.x` by `inner.right() - galley.size().x`.
+        // Shifting rows by `-galley.rect.min.x` puts the galley in `[0.0, max_w]` so every
+        // line's right edge aligns pixel-exact flush against the right 16.0px padding!
+        let shift_x = -galley.rect.min.x;
+        if shift_x > 0.0 {
+            let g = Arc::make_mut(&mut galley);
+            for row in &mut g.rows {
+                row.pos.x += shift_x;
+            }
+            g.rect = g.rect.translate(vec2(shift_x, 0.0));
+            g.mesh_bounds = g.mesh_bounds.translate(vec2(shift_x, 0.0));
+        }
+        galley
+    };
+
+    let output = TextEdit::multiline(text)
+        .id(id)
+        .font(font.clone())
+        .desired_width(f32::INFINITY)
+        .desired_rows(4)
+        .frame(false)
+        .margin(margin)
+        .background_color(bg_color)
+        .text_color(text_color)
+        .horizontal_align(Align::RIGHT)
+        .layouter(&mut layouter)
+        .show(ui);
+
+    if has_arabic {
+        ui.visuals_mut().text_cursor = prev_cursor.clone();
     }
+
+    let has_focus = output.response.has_focus();
+    let viewport_focused = ui.ctx().input(|i| i.focused);
+
+    if text.is_empty() && !has_focus && !hint.is_empty() {
+        let inner = output.response.rect - margin;
+        let anchor = pos2(inner.right(), inner.top());
+        let painter = ui.painter_at(output.text_clip_rect.expand(1.0));
+        painter.text(
+            anchor,
+            egui::Align2::RIGHT_TOP,
+            shape_arabic(hint),
+            font,
+            theme::MUTED,
+        );
+    } else if has_arabic && has_focus && viewport_focused {
+        let logical_idx = output
+            .cursor_range
+            .map(|r| r.primary.index)
+            .unwrap_or_else(|| text.chars().count());
+        let visual_idx = rtl_multiline_visual_cursor_index(text, &shaped_snapshot, logical_idx);
+        let local = output
+            .galley
+            .pos_from_cursor(egui::text::CCursor::new(visual_idx));
+        let caret_x = output.galley_pos.x + local.min.x;
+        let caret_top = output.galley_pos.y + local.min.y;
+        let caret_bottom = output.galley_pos.y + local.max.y;
+
+        let now = ui.ctx().input(|i| i.time);
+        let reset_blink = output.response.changed() || output.response.gained_focus();
+        let blink_id = id.with("rtl_multiline_caret_time");
+        let last_active = ui.ctx().data_mut(|d| {
+            if reset_blink {
+                d.insert_temp(blink_id, now);
+                now
+            } else {
+                *d.get_temp_mut_or(blink_id, now)
+            }
+        });
+        let elapsed = (now - last_active).max(0.0) as f32;
+        let on_dur = prev_cursor.on_duration.max(0.1);
+        let off_dur = prev_cursor.off_duration.max(0.1);
+        let period = on_dur + off_dur;
+        let visible = !prev_cursor.blink || (elapsed % period) < on_dur;
+        if visible {
+            let painter = ui.painter_at(output.text_clip_rect.expand(2.0));
+            painter.line_segment(
+                [pos2(caret_x, caret_top), pos2(caret_x, caret_bottom)],
+                Stroke::new(1.5, theme::INK),
+            );
+        }
+        if prev_cursor.blink {
+            ui.ctx()
+                .request_repaint_after(Duration::from_millis((on_dur * 500.0) as u64));
+        }
+    }
+
+    output
 }
 
 /// A bounded-height right-to-left row.
@@ -3026,24 +3662,46 @@ fn window_control(ui: &mut Ui, glyph: &str, tip: &str) -> egui::Response {
     response.on_hover_text(tip)
 }
 
-/// A text-only link used by the ultra-minimalist top bar (`14.0px` SemiBold).
-fn text_link(ui: &mut Ui, text: &str, active: bool) -> egui::Response {
-    let color = if active { theme::INK } else { theme::SLATE };
-    let response = ui
-        .add(
-            Label::new(mono(text, 14.0).strong().color(color))
-                .selectable(false)
-                .sense(Sense::click()),
-        )
-        .on_hover_cursor(CursorIcon::PointingHand);
-    if !active && response.hovered() {
+/// Single-click architectural top-bar navigation tab (`HOME`, `INDEX`, `HARBOR`)
+/// with full-bar height hit target, `PointingHand` cursor, and crisp `2.0px`
+/// solid `#0F172A` active bottom underline.
+fn top_bar_tab(ui: &mut Ui, text: &str, active: bool) -> egui::Response {
+    let font = FontId::monospace(14.0);
+    let text_w = ui
+        .fonts_mut(|f| f.layout_no_wrap(text.to_string(), font.clone(), Color32::TRANSPARENT))
+        .size()
+        .x;
+    let tab_w = (text_w + 14.0).max(48.0);
+    let tab_h = ui.available_height().max(32.0);
+    let (rect, response) = ui.allocate_exact_size(vec2(tab_w, tab_h), Sense::click());
+    let response = response.on_hover_cursor(CursorIcon::PointingHand);
+    let color = if active || response.hovered() {
+        theme::INK
+    } else {
+        theme::SLATE
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        font.clone(),
+        color,
+    );
+    if active {
+        // Bold impression + crisp 2.0px #0F172A bottom active underline.
         ui.painter().text(
-            response.rect.left_center(),
-            egui::Align2::LEFT_CENTER,
+            rect.center() + vec2(0.45, 0.0),
+            egui::Align2::CENTER_CENTER,
             text,
-            FontId::monospace(14.0),
-            theme::INK,
+            font,
+            color,
         );
+        let underline = Rect::from_min_max(
+            pos2(rect.left() + 4.0, rect.bottom() - 2.0),
+            pos2(rect.right() - 4.0, rect.bottom()),
+        );
+        ui.painter()
+            .rect_filled(underline, CornerRadius::same(0), theme::INK);
     }
     response
 }
@@ -3264,16 +3922,24 @@ const HOVER_STRIP_H: f32 = 22.0;
 const HOVER_STRIP_SLOT_W: f32 = 24.0;
 /// Top margin applied when top-aligning dense task trees inside a pane.
 const DENSE_TOP_MARGIN: f32 = 14.0;
+/// Extra bottom padding reserved beneath the bottom card's 3.0px shadow inside scroll areas.
+const BOTTOM_SCROLL_PAD: f32 = 12.0;
 /// Dedicated bottom input strip height (`#FFFFFF` fill, `1.0px` `#E2E8F0` top border).
 const BOTTOM_INPUT_HEIGHT: f32 = 38.0;
-/// Generous horizontal breathing room between parent left edge and child right edge.
+/// Generous horizontal breathing room between parent left edge and child right edge (single column).
 const BRANCH_GAP_X: f32 = 56.0;
+/// Compact horizontal Bezier branch span inside 2-column split panes so child cards never cross columns.
+const SPLIT_BRANCH_GAP_X: f32 = 30.0;
+/// Inner horizontal margin on each side of the center vertical divider (`16.0px` total gutter).
+const SPLIT_COL_GUTTER: f32 = 8.0;
 
 /// Metrics driving the horizontal right-to-left mind-map layout.
 #[derive(Clone, Copy)]
 struct MindMapMetrics {
-    /// Maximum width of a task card (42% of the pane width).
+    /// Maximum width of a root task card.
     max_card_w: f32,
+    /// Maximum width of a child sub-branch card (capped tighter inside split columns).
+    child_max_card_w: f32,
     /// Horizontal gap between parent and child cards (Bezier curves span this).
     gap_x: f32,
     /// Minimum height of one task card.
@@ -3282,7 +3948,7 @@ struct MindMapMetrics {
     gap_y: f32,
     /// Font size of a level-0 task (15.5px).
     font_size: f32,
-    /// Font size of a nested branch (15.5px).
+    /// Font size of a nested branch (14.5px).
     font_size_deep: f32,
     /// Horizontal padding inside a card (14.0px base).
     pad_x: f32,
@@ -3295,7 +3961,8 @@ impl MindMapMetrics {
     fn scaled(self, scale: f32) -> Self {
         Self {
             max_card_w: (self.max_card_w * scale).max(64.0),
-            gap_x: (self.gap_x * scale).max(24.0),
+            child_max_card_w: (self.child_max_card_w * scale).max(56.0),
+            gap_x: (self.gap_x * scale).max(18.0),
             min_card_h: self.min_card_h * scale,
             gap_y: (self.gap_y * scale).max(4.0),
             font_size: (self.font_size * scale).clamp(10.0, 16.0),
@@ -3339,10 +4006,13 @@ fn mind_map_metrics_for_density(pane_w: f32, total_nodes: usize) -> MindMapMetri
         (14.0, 8.0, 8.0)
     };
 
+    let max_card_w = (pane_w * 0.56)
+        .clamp(180.0, 380.0)
+        .min((pane_w - 20.0).max(120.0));
+
     MindMapMetrics {
-        max_card_w: (pane_w * 0.56)
-            .clamp(180.0, 380.0)
-            .min((pane_w - 20.0).max(120.0)),
+        max_card_w,
+        child_max_card_w: max_card_w,
         gap_x: BRANCH_GAP_X,
         min_card_h: font_size * 1.35 + pad_y * 2.0,
         gap_y,
@@ -3351,6 +4021,24 @@ fn mind_map_metrics_for_density(pane_w: f32, total_nodes: usize) -> MindMapMetri
         pad_x,
         pad_y,
     }
+}
+
+/// Split-column mind-map metrics for one half of a 2-column pane (`col_w`):
+/// * Uses a compact `30.0px` horizontal Bezier span (`SPLIT_BRANCH_GAP_X`).
+/// * Caps root & child card widths so `root + 30px + child` fits strictly inside
+///   `col_w` without touching the `8.0px` center gutter or crossing columns.
+fn mind_map_metrics_for_split_col(col_w: f32, total_nodes: usize) -> MindMapMetrics {
+    let mut m = mind_map_metrics_for_density(col_w, total_nodes);
+    let usable = (col_w - SHADOW_PAD - 2.0).max(110.0);
+    let cards_budget = (usable - SPLIT_BRANCH_GAP_X).max(80.0);
+    let root_cap = (cards_budget * 0.56).clamp(96.0, 240.0).min(usable);
+    let child_cap = (cards_budget * 0.44)
+        .clamp(72.0, 170.0)
+        .min((usable - SPLIT_BRANCH_GAP_X - 72.0).max(64.0));
+    m.max_card_w = root_cap;
+    m.child_max_card_w = child_cap;
+    m.gap_x = SPLIT_BRANCH_GAP_X;
+    m
 }
 
 /// Finds the contiguous split index (`1..heights.len()`) that partitions root
@@ -3497,8 +4185,13 @@ fn measure_card_size(
     is_editing: bool,
 ) -> Vec2 {
     let font_size = font_for_depth(m, depth);
+    let cap_w = if depth == 0 {
+        m.max_card_w
+    } else {
+        m.child_max_card_w
+    };
     let badge_reserve = if depth == 0 { ROOT_BADGE_W } else { 0.0 };
-    let max_text_w = (m.max_card_w - m.pad_x * 2.0 - badge_reserve).max(40.0);
+    let max_text_w = (cap_w - m.pad_x * 2.0 - badge_reserve).max(40.0);
     let line_h = font_size * 1.35;
 
     let sample = if node.title.trim().is_empty() {
@@ -3533,21 +4226,67 @@ fn measure_card_size(
     let inner_h = text_size.y.max(line_h);
 
     vec2(
-        (inner_w + m.pad_x * 2.0 + badge_reserve).min(m.max_card_w),
+        (inner_w + m.pad_x * 2.0 + badge_reserve).min(cap_w),
         (inner_h + m.pad_y * 2.0).max(m.min_card_h),
     )
 }
 
-/// Computes the crisp 0.0px `[+N]` folded-branch badge size (`13.0px` monospace).
-fn collapsed_badge_size(ui: &Ui, hidden_count: usize) -> Vec2 {
-    let text = format!("[+{}]", hidden_count);
-    let galley = ui
+/// Zero-width-penalty `14.0px × 14.0px` fold handle straddling a parent card's
+/// left border center (`card_rect.left_center()`).
+const FOLD_HANDLE_SIZE: f32 = 14.0;
+/// Generous invisible click hitbox (`24.0px × 24.0px`) for the fold handle.
+const FOLD_HANDLE_HITBOX: f32 = 24.0;
+
+/// Auto-collapses ONLY parent groups whose descendants are 100% Completed
+/// (`TaskStatus::Completed`) when the pane exceeds `avail_h`, skipping any
+/// group the user manually expanded. Never touches active/in-progress trees.
+fn auto_collapse_completed_groups(
+    ui: &Ui,
+    nodes: &mut [TaskNode],
+    m: &MindMapMetrics,
+    avail_h: f32,
+    manually_expanded: &HashSet<String>,
+) -> bool {
+    let mut changed = false;
+    for i in 0..nodes.len() {
+        let cur_h =
+            stack_height(ui, nodes, m, 0, None) + DENSE_TOP_MARGIN + SHADOW_OFFSET.y + BOTTOM_SCROLL_PAD;
+        if cur_h <= avail_h {
+            break;
+        }
+        let node = &mut nodes[i];
+        if !node.is_folded()
+            && node.all_children_completed()
+            && !manually_expanded.contains(&node.id)
+        {
+            node.collapsed = true;
+            node.is_expanded = false;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Computes the crisp `0.0px` left-border-straddling fold handle dimensions
+/// (`14.0px × 14.0px` base, widening slightly only for multi-digit `+N`).
+fn fold_handle_visual_size(ui: &Ui, is_folded: bool, hidden_count: usize) -> Vec2 {
+    if !is_folded {
+        return vec2(FOLD_HANDLE_SIZE, FOLD_HANDLE_SIZE);
+    }
+    let text = format!("+{}", hidden_count);
+    let text_w = ui
         .painter()
-        .layout_no_wrap(text, FontId::monospace(13.0), theme::PANE);
-    galley.size() + vec2(8.0, 4.0)
+        .layout_no_wrap(text, FontId::monospace(11.0), theme::PANE)
+        .size()
+        .x;
+    vec2(
+        FOLD_HANDLE_SIZE.max((text_w + 4.0).ceil()),
+        FOLD_HANDLE_SIZE,
+    )
 }
 
 /// Horizontal width a single node (with its whole branch) occupies.
+/// The straddling `14px` fold handle adds virtually zero horizontal penalty.
 fn subtree_width(
     ui: &Ui,
     node: &TaskNode,
@@ -3560,8 +4299,8 @@ fn subtree_width(
         return own_w;
     }
     if node.is_folded() {
-        let badge_w = collapsed_badge_size(ui, node.descendant_count()).x;
-        return own_w + badge_w + 4.0;
+        let half_handle = fold_handle_visual_size(ui, true, node.descendant_count()).x * 0.5;
+        return own_w + half_handle + 2.0;
     }
     own_w + m.gap_x + stack_width(ui, &node.children, m, depth + 1, editing_id)
 }
@@ -3655,6 +4394,19 @@ struct HoverControl {
     plus_hovered: bool,
     notes_hovered: bool,
     is_completed: bool,
+    is_direct_hover: bool,
+}
+
+/// Deferred visual for the `14.0px × 14.0px` left-border-straddling fold handle
+/// (`[−]` when expanded, `[+N]` when collapsed), painted cleanly over Bezier origins
+/// while staying strictly clipped to its column rect.
+#[derive(Clone, Copy)]
+struct FoldHandleVisual {
+    rect: Rect,
+    clip_rect: Rect,
+    is_folded: bool,
+    hidden_count: usize,
+    emphasized: bool,
 }
 
 /// Renders one column of the horizontal mind-map and returns the anchors of
@@ -3673,11 +4425,13 @@ fn render_mind_map_nodes(
     zen: bool,
     hover_clamp_rect: Rect,
     prev_hovered_card: Option<&str>,
+    manually_expanded_nodes: &mut HashSet<String>,
     focused_node_id: &mut Option<String>,
     editing_node_id: &mut Option<String>,
     request_focus_id: &mut Option<String>,
     selected_node_ids: &mut HashSet<String>,
     hover_controls: &mut Vec<HoverControl>,
+    fold_handles: &mut Vec<FoldHandleVisual>,
     actions: &mut PaneActions,
 ) -> Vec<NodeAnchor> {
     let mut cards = Vec::new();
@@ -3723,11 +4477,13 @@ fn render_mind_map_nodes(
             zen,
             hover_clamp_rect,
             prev_hovered_card,
+            manually_expanded_nodes,
             focused_node_id,
             editing_node_id,
             request_focus_id,
             selected_node_ids,
             hover_controls,
+            fold_handles,
             actions,
         );
 
@@ -3746,11 +4502,13 @@ fn render_mind_map_nodes(
                 zen,
                 hover_clamp_rect,
                 prev_hovered_card,
+                manually_expanded_nodes,
                 focused_node_id,
                 editing_node_id,
                 request_focus_id,
                 selected_node_ids,
                 hover_controls,
+                fold_handles,
                 actions,
             );
             // Hovering anywhere in the branch lights up the whole branch.
@@ -3782,11 +4540,13 @@ fn render_node_card(
     zen: bool,
     hover_clamp_rect: Rect,
     prev_hovered_card: Option<&str>,
+    manually_expanded_nodes: &mut HashSet<String>,
     focused_node_id: &mut Option<String>,
     editing_node_id: &mut Option<String>,
     request_focus_id: &mut Option<String>,
     selected_node_ids: &mut HashSet<String>,
     hover_controls: &mut Vec<HoverControl>,
+    fold_handles: &mut Vec<FoldHandleVisual>,
     actions: &mut PaneActions,
 ) -> NodeAnchor {
     let node_id = node.id.clone();
@@ -3802,29 +4562,33 @@ fn render_node_card(
     };
     let has_notes = !node.notes.trim().is_empty();
 
-    let badge_rect = if is_folded {
-        let size = collapsed_badge_size(ui, hidden_count);
-        Some(Rect::from_min_max(
-            pos2(rect.left() - size.x, rect.center().y - size.y * 0.5),
-            pos2(rect.left(), rect.center().y + size.y * 0.5),
-        ))
+    // Zero-width-penalty 14×14 architectural fold handle straddling `rect.left_center()`.
+    // Its 24×24 invisible click hitbox is nudged 3px left so it covers the entire
+    // handle generously without colliding with the top-left dog-ear zone.
+    let fold_handle_rects = if has_children {
+        let vis_size = fold_handle_visual_size(ui, is_folded, hidden_count);
+        let vis_rect = Rect::from_center_size(rect.left_center(), vis_size);
+        let hit_rect = Rect::from_center_size(
+            pos2(rect.left() - 3.0, rect.center().y),
+            vec2(vis_size.x.max(FOLD_HANDLE_HITBOX), FOLD_HANDLE_HITBOX),
+        );
+        Some((vis_rect, hit_rect))
     } else {
         None
     };
 
-    // Zero-overlap contextual hover strip flush along the top-left outer edge
-    // (`y - 22.0`), clamped inside `pane_rect.shrink(4.0)` so short cards near
-    // the right edge never clip the strip.
+    // Sticky zero-gap contextual hover strip flush against the card's top edge
+    // (`strip_rect.bottom() == rect.top()`, zero gap), clamped horizontally inside
+    // `pane_rect.shrink(4.0)` so short cards near the right edge never clip the strip.
     let strip_w = HOVER_STRIP_SLOT_W * 3.0;
     let clamped_x = rect.left().clamp(
         hover_clamp_rect.left(),
         (hover_clamp_rect.right() - strip_w).max(hover_clamp_rect.left()),
     );
-    let clamped_y = (rect.top() - HOVER_STRIP_H).clamp(
-        hover_clamp_rect.top(),
-        (hover_clamp_rect.bottom() - HOVER_STRIP_H).max(hover_clamp_rect.top()),
+    let strip_rect = Rect::from_min_size(
+        pos2(clamped_x, rect.top() - HOVER_STRIP_H),
+        vec2(strip_w, HOVER_STRIP_H),
     );
-    let strip_rect = Rect::from_min_size(pos2(clamped_x, clamped_y), vec2(strip_w, HOVER_STRIP_H));
     let check_rect = Rect::from_min_size(
         strip_rect.left_top(),
         vec2(HOVER_STRIP_SLOT_W, HOVER_STRIP_H),
@@ -3842,20 +4606,24 @@ fn render_node_card(
     );
 
     let mut card_hit_area = rect;
-    if let Some(b_rect) = badge_rect {
-        card_hit_area = card_hit_area.union(b_rect);
+    if let Some((vis_rect, _)) = fold_handle_rects {
+        card_hit_area = card_hit_area.union(vis_rect);
     }
-    let was_hovered = prev_hovered_card == Some(node_id.as_str());
-    let strip_hover_zone = Rect::from_min_max(
-        pos2(strip_rect.left() - 2.0, strip_rect.top() - 6.0),
-        pos2(strip_rect.right() + 2.0, strip_rect.bottom() + 2.0),
-    );
+    let col_clip = ui.clip_rect();
+    let card_visible = rect.intersects(col_clip) && rect.top() >= col_clip.top() - 2.0;
+    let is_sticky_card = prev_hovered_card == Some(node_id.as_str());
+    let bridge_zone = rect.union(strip_rect).expand(4.0);
     let hover_pos = ui.input(|i| i.pointer.hover_pos());
-    let pointer_on_card = hover_pos.is_some_and(|p| card_hit_area.contains(p));
-    let pointer_on_strip =
-        !zen && !is_editing && was_hovered && hover_pos.is_some_and(|p| strip_hover_zone.contains(p));
-    let hovering = pointer_on_card || pointer_on_strip;
-    if hovering && !zen && !is_editing && actions.next_hovered_card.is_none() {
+    let pointer_on_card =
+        card_visible && hover_pos.is_some_and(|p| col_clip.contains(p) && card_hit_area.contains(p));
+    let pointer_in_bridge = card_visible
+        && !zen
+        && !is_editing
+        && is_sticky_card
+        && hover_pos.is_some_and(|p| bridge_zone.contains(p));
+    let direct_hover = pointer_on_card || pointer_in_bridge;
+    let hovering = direct_hover || (card_visible && !zen && !is_editing && is_sticky_card);
+    if direct_hover && !zen && !is_editing && actions.next_hovered_card.is_none() {
         actions.next_hovered_card = Some(node_id.clone());
     }
 
@@ -3925,27 +4693,6 @@ fn render_node_card(
             theme::INK,
             Stroke::NONE,
         ));
-    }
-
-    // 4. Folded branch badge `[+N]` flush on the left edge of the parent card.
-    if let Some(b_rect) = badge_rect {
-        let badge_text = format!("[+{}]", hidden_count);
-        let font = FontId::monospace(13.0);
-        painter.rect_filled(b_rect, CornerRadius::same(0), theme::INK);
-        painter.text(
-            b_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            &badge_text,
-            font.clone(),
-            theme::PANE,
-        );
-        painter.text(
-            b_rect.center() + vec2(0.5, 0.0),
-            egui::Align2::CENTER_CENTER,
-            &badge_text,
-            font,
-            theme::PANE,
-        );
     }
 
     let badge_reserve = if root_number.is_some() {
@@ -4043,20 +4790,53 @@ fn render_node_card(
             )
             .on_hover_cursor(CursorIcon::PointingHand);
 
-        if let Some(b_rect) = badge_rect {
-            let badge_response = ui
+        // Zero-width-penalty left-border-straddling fold handle (`[−]` / `[+N]`).
+        // Registered after card & dog-ear so clicking its 24×24 hitbox ONLY
+        // toggles collapse/expand without opening the note card or renaming.
+        let mut fold_handle_clicked = false;
+        if let Some((vis_rect, hit_rect)) = fold_handle_rects {
+            let handle_response = ui
                 .interact(
-                    min_hitbox(b_rect),
-                    ui.id().with(("fold_badge", &node_id)),
+                    hit_rect,
+                    ui.id().with(("fold_handle", &node_id)),
                     Sense::click(),
                 )
                 .on_hover_cursor(CursorIcon::PointingHand);
-            if badge_response.clicked() {
-                node.collapsed = false;
-                node.is_expanded = true;
+            if handle_response.clicked() {
+                fold_handle_clicked = true;
+                node.collapsed = !node.collapsed;
+                node.is_expanded = !node.collapsed;
+                if node.collapsed {
+                    manually_expanded_nodes.remove(&node_id);
+                } else {
+                    manually_expanded_nodes.insert(node_id.clone());
+                }
                 actions.dirty = true;
             }
-            badge_response.on_hover_text("CLICK: EXPAND BRANCH");
+            let final_folded = node.is_folded();
+            let final_hidden = if final_folded {
+                node.descendant_count()
+            } else {
+                0
+            };
+            let final_vis_rect = if fold_handle_clicked {
+                let sz = fold_handle_visual_size(ui, final_folded, final_hidden);
+                Rect::from_center_size(rect.left_center(), sz)
+            } else {
+                vis_rect
+            };
+            fold_handles.push(FoldHandleVisual {
+                rect: final_vis_rect,
+                clip_rect: col_clip,
+                is_folded: final_folded,
+                hidden_count: final_hidden,
+                emphasized: hovering || handle_response.hovered(),
+            });
+            handle_response.on_hover_text(if node.is_folded() {
+                "CLICK: EXPAND BRANCH"
+            } else {
+                "CLICK: COLLAPSE BRANCH"
+            });
         }
 
         let text_color = match node.status {
@@ -4088,7 +4868,7 @@ fn render_node_card(
             content_rect.right(),
             content_rect.center().y - galley.size().y * 0.5,
         );
-        let text_painter = ui.painter_at(content_rect.expand(1.0));
+        let text_painter = ui.painter_at(content_rect.expand(1.0).intersect(col_clip));
         if is_root {
             // Bold visual weight (`15.5px` Bold) for root cards.
             text_painter.galley(text_pos, galley.clone(), text_color);
@@ -4098,7 +4878,13 @@ fn render_node_card(
             text_painter.galley(text_pos, galley, text_color);
         }
 
-        if dog_ear_response.clicked() {
+        // Strict click separation:
+        // - Fold handle (`[−]` / `[+N]`): toggles collapse/expand only (handled above).
+        // - Double-click card body: inline rename card text.
+        // - Single-click card body: select card & open its light paper note card.
+        if fold_handle_clicked {
+            // Do not open note card or trigger inline rename.
+        } else if dog_ear_response.clicked() {
             selected_node_ids.clear();
             selected_node_ids.insert(node_id.clone());
             *focused_node_id = Some(node_id.clone());
@@ -4107,15 +4893,9 @@ fn render_node_card(
             selected_node_ids.clear();
             selected_node_ids.insert(node_id.clone());
             *focused_node_id = Some(node_id.clone());
-            if has_children {
-                node.collapsed = !node.collapsed;
-                node.is_expanded = !node.collapsed;
-                actions.dirty = true;
-            } else {
-                *editing_node_id = Some(node_id.clone());
-                *request_focus_id = Some(node_id.clone());
-                actions.focus_node = Some(node_id.clone());
-            }
+            *editing_node_id = Some(node_id.clone());
+            *request_focus_id = Some(node_id.clone());
+            actions.focus_node = Some(node_id.clone());
         } else if card_response.clicked() {
             if ui.input(|i| i.modifiers.ctrl || i.modifiers.command) {
                 if is_selected {
@@ -4160,22 +4940,16 @@ fn render_node_card(
             dog_ear_response.on_hover_text(shape_arabic("الملاحظات / Notes"));
         }
 
-        let dbl_hint = if has_children {
-            "DOUBLE-CLICK: FOLD/UNFOLD"
-        } else {
-            "DOUBLE-CLICK: EDIT"
-        };
         card_response.on_hover_text(format!(
-            "{} · CLICK: SELECT · {} · N: NOTES · 1/2/3 OR SPACE: STATUS",
+            "{} · CLICK: SELECT & NOTES · DOUBLE-CLICK: RENAME · 1/2/3 OR SPACE: STATUS",
             node.status.label_en().to_uppercase(),
-            dbl_hint,
         ));
     }
 
-    let show_strip = !zen
+    let show_strip = card_visible
+        && !zen
         && !is_editing
-        && hovering
-        && actions.next_hovered_card.as_deref() == Some(node_id.as_str());
+        && (direct_hover || (is_sticky_card && actions.next_hovered_card.is_none()));
     if show_strip {
         // Expand each strip action upward by 6px for effortless 28px-tall click targets
         // without extending downward into the card's text or dog-ear region.
@@ -4230,6 +5004,7 @@ fn render_node_card(
             plus_hovered: plus_response.hovered(),
             notes_hovered: notes_response.hovered(),
             is_completed: node.status == TaskStatus::Completed,
+            is_direct_hover: direct_hover,
         });
 
         check_response.on_hover_text("TOGGLE ACTIVE / COMPLETED");
@@ -4346,6 +5121,54 @@ fn draw_mind_map_threads(ui: &Ui, parent: NodeAnchor, children: &[NodeAnchor]) {
             color,
             Stroke::NONE,
         ));
+    }
+}
+
+/// Paints the zero-width-penalty `14.0px × 14.0px` fold handles (`[−]` / `[+N]`)
+/// straddling each parent card's left border center cleanly over Bezier origins,
+/// strictly clipped to each handle's column rect.
+fn paint_fold_handles(ui: &Ui, handles: &[FoldHandleVisual]) {
+    let font = FontId::monospace(11.0);
+    for handle in handles {
+        let painter = ui.painter_at(handle.clip_rect);
+        if handle.is_folded {
+            let label = format!("+{}", handle.hidden_count);
+            painter.rect_filled(handle.rect, CornerRadius::same(0), theme::INK);
+            painter.text(
+                handle.rect.center(),
+                egui::Align2::CENTER_CENTER,
+                &label,
+                font.clone(),
+                theme::PANE,
+            );
+            painter.text(
+                handle.rect.center() + vec2(0.5, 0.0),
+                egui::Align2::CENTER_CENTER,
+                &label,
+                font.clone(),
+                theme::PANE,
+            );
+        } else {
+            let border_color = if handle.emphasized {
+                theme::INK
+            } else {
+                theme::SLATE
+            };
+            painter.rect_filled(handle.rect, CornerRadius::same(0), theme::PANE);
+            painter.rect_stroke(
+                handle.rect,
+                CornerRadius::same(0),
+                Stroke::new(1.2, border_color),
+                StrokeKind::Inside,
+            );
+            painter.text(
+                handle.rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "−",
+                font.clone(),
+                border_color,
+            );
+        }
     }
 }
 
@@ -5189,8 +6012,10 @@ mod tests {
         let _ = ctx.run(Default::default(), |ctx| app.draw(ctx));
         let out_p1 = ctx.run(Default::default(), |ctx| app.draw(ctx));
         let text_p1 = rendered_text(&out_p1);
-        assert!(text_p1.contains("BOARD"));
+        assert!(text_p1.contains("HOME"));
+        assert!(text_p1.contains("INDEX"));
         assert!(text_p1.contains("HARBOR"));
+        assert!(!text_p1.contains("BOARD"));
         assert!(text_p1.contains("PAGE 1 / 2"), "got {text_p1:?}");
         assert!(!text_p1.contains("ZEN [Ctrl+H]"), "ZEN button must be removed");
         assert!(text_p1.contains("Pane 4"));
@@ -5328,8 +6153,19 @@ mod tests {
 
         let text = rendered_text(&output);
         assert!(
-            text.contains("[+2]"),
-            "expected [+2] badge for folded parent; got {text:?}"
+            text.contains("+2"),
+            "expected +2 collapsed fold handle for folded parent; got {text:?}"
+        );
+        assert!(
+            output.shapes.iter().any(|c| match &c.shape {
+                egui::Shape::Rect(r) => {
+                    r.fill == theme::INK
+                        && (r.rect.height() - FOLD_HANDLE_SIZE).abs() < 0.1
+                        && r.rect.width() >= FOLD_HANDLE_SIZE - 0.1
+                }
+                _ => false,
+            }),
+            "expected solid #0F172A 14.0px fold handle square for collapsed branch"
         );
         assert!(
             !text.contains(&shape_arabic("مراجعة مع المحامي")),
@@ -5705,6 +6541,778 @@ mod tests {
         assert!(
             !text_focused.contains(&shape_arabic("+ اكتب فرعاً جديداً...")),
             "placeholder must hide immediately when bottom input has focus; got {text_focused:?}"
+        );
+    }
+
+    #[test]
+    fn fold_handle_click_separation_and_parent_double_click_rename() {
+        let ctx = egui::Context::default();
+        crate::rtl_text::install_arabic_fonts(&ctx);
+        crate::theme::install(&ctx);
+
+        let mut app = WhiteboardApp::from_data(sample_data());
+        app.show_quick_entry_modal = false;
+        app.data.current_day.panes.truncate(1);
+        let parent_id = app.data.current_day.panes[0].subtasks[0].id.clone();
+
+        // Warm-up frames: expanded parent shows subtle 14×14 handle (#FFFFFF fill, 1.2px #64748B border, −).
+        let _ = ctx.run(Default::default(), |ctx| app.draw(ctx));
+        let out_expanded = ctx.run(Default::default(), |ctx| app.draw(ctx));
+        assert!(
+            rendered_text(&out_expanded).contains("−"),
+            "expanded parent with children must render subtle − fold handle"
+        );
+        let handle_rect = out_expanded
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Rect(r)
+                    if r.stroke.color == theme::SLATE
+                        && (r.stroke.width - 1.2).abs() < 0.05
+                        && (r.rect.width() - FOLD_HANDLE_SIZE).abs() < 0.1
+                        && (r.rect.height() - FOLD_HANDLE_SIZE).abs() < 0.1 =>
+                {
+                    Some(r.rect)
+                }
+                _ => None,
+            })
+            .expect("expected 14.0x14.0 expanded fold handle straddling parent left border");
+        assert!(
+            out_expanded.shapes.iter().any(|c| match &c.shape {
+                egui::Shape::Rect(r) => {
+                    r.fill == theme::PANE
+                        && (r.rect.min.x - handle_rect.min.x).abs() < 0.1
+                        && (r.rect.min.y - handle_rect.min.y).abs() < 0.1
+                        && (r.rect.width() - FOLD_HANDLE_SIZE).abs() < 0.1
+                }
+                _ => false,
+            }),
+            "expanded fold handle must have a crisp #FFFFFF fill"
+        );
+
+        // 1. Click fold handle -> collapses children ONLY (no note card opened, no inline rename).
+        let click_at = |pos: Pos2, t: f64, app: &mut WhiteboardApp| {
+            let mut down = egui::RawInput::default();
+            down.time = Some(t);
+            down.events.push(egui::Event::PointerMoved(pos));
+            down.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let _ = ctx.run(down, |ctx| app.draw(ctx));
+
+            let mut up = egui::RawInput::default();
+            up.time = Some(t + 0.05);
+            up.events.push(egui::Event::PointerMoved(pos));
+            up.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            ctx.run(up, |ctx| app.draw(ctx))
+        };
+
+        let _ = click_at(handle_rect.center(), 1.0, &mut app);
+        assert!(
+            app.data.current_day.panes[0].subtasks[0].collapsed,
+            "clicking fold handle must collapse parent children"
+        );
+        assert!(
+            app.pane_note_drawers.is_empty(),
+            "clicking fold handle must NOT open the note card"
+        );
+        assert!(
+            app.editing_node_id.is_none(),
+            "clicking fold handle must NOT enter inline rename"
+        );
+
+        // 2. Click fold handle again -> expands children and records manual override.
+        let _ = click_at(handle_rect.center(), 2.0, &mut app);
+        assert!(
+            !app.data.current_day.panes[0].subtasks[0].collapsed,
+            "clicking collapsed fold handle must expand parent children"
+        );
+        assert!(
+            app.manually_expanded_nodes.contains(&parent_id),
+            "manually expanding a folded group must record override against auto-collapse"
+        );
+        assert!(
+            app.pane_note_drawers.is_empty(),
+            "re-expanding fold handle must NOT open note card"
+        );
+
+        // 3. Single-click card body -> selects card & opens its light paper note card.
+        let card_body_pos = pos2(handle_rect.center().x + 48.0, handle_rect.center().y);
+        let _ = click_at(card_body_pos, 3.0, &mut app);
+        assert_eq!(
+            app.pane_note_drawers
+                .get(&app.data.current_day.panes[0].id)
+                .map(String::as_str),
+            Some(parent_id.as_str()),
+            "single-clicking card body must open its light paper note card"
+        );
+        assert!(
+            app.editing_node_id.is_none(),
+            "single-clicking card body must NOT start inline rename"
+        );
+
+        // 4. Double-click parent card body -> enters inline rename mode.
+        let _ = click_at(card_body_pos, 4.0, &mut app);
+        let _ = click_at(card_body_pos, 4.12, &mut app);
+        assert_eq!(
+            app.editing_node_id.as_deref(),
+            Some(parent_id.as_str()),
+            "double-clicking parent card body must enter inline rename mode"
+        );
+    }
+
+    #[test]
+    fn auto_collapse_only_folds_completed_groups_when_overflowing() {
+        let ctx = egui::Context::default();
+        crate::rtl_text::install_arabic_fonts(&ctx);
+        crate::theme::install(&ctx);
+
+        let mut data = AppData::default();
+        let mut pane = MainTaskPane::new("لوحة طويلة");
+
+        // Group 0: 100% Completed children -> MUST auto-collapse on vertical overflow.
+        let mut completed_group = TaskNode::new("مجموعة مكتملة");
+        for i in 1..=5 {
+            let mut c = TaskNode::new(&format!("منجز {}", i));
+            c.status = TaskStatus::Completed;
+            completed_group.children.push(c);
+        }
+        let completed_id = completed_group.id.clone();
+
+        // Group 1: Active/in-progress children -> MUST NEVER auto-collapse.
+        let mut active_group = TaskNode::new("مجموعة نشطة");
+        for i in 1..=5 {
+            active_group
+                .children
+                .push(TaskNode::new(&format!("نشط {}", i)));
+        }
+
+        // Group 2: 100% Completed children, but manually expanded by user -> MUST stay expanded.
+        let mut manual_group = TaskNode::new("مجموعة مفتوحة يدوياً");
+        for i in 1..=4 {
+            let mut c = TaskNode::new(&format!("مكتمل يدوي {}", i));
+            c.status = TaskStatus::Completed;
+            manual_group.children.push(c);
+        }
+        let manual_id = manual_group.id.clone();
+
+        pane.subtasks = vec![completed_group, active_group, manual_group];
+        data.current_day.panes.push(pane);
+
+        let mut app = WhiteboardApp::from_data(data);
+        app.show_quick_entry_modal = false;
+        app.manually_expanded_nodes.insert(manual_id);
+
+        // Constrained viewport height forces vertical overflow so the auto-collapse policy triggers.
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 360.0)));
+        let _ = ctx.run(raw.clone(), |ctx| app.draw(ctx));
+        let _ = ctx.run(raw, |ctx| app.draw(ctx));
+
+        let subtasks = &app.data.current_day.panes[0].subtasks;
+        assert_eq!(subtasks[0].id, completed_id);
+        assert!(
+            subtasks[0].collapsed,
+            "100% completed group must auto-collapse when pane exceeds available vertical height"
+        );
+        assert!(
+            !subtasks[1].collapsed,
+            "active/in-progress group must NEVER auto-collapse"
+        );
+        assert!(
+            !subtasks[2].collapsed,
+            "manually expanded completed group must stay expanded"
+        );
+    }
+
+    #[test]
+    fn split_columns_clip_strictly_with_gutter_compact_bezier_and_zero_overlap() {
+        // Split-column metrics use a compact 30.0px Bezier span and cap child cards
+        // so `root + 30px + child` fits cleanly inside one half-column.
+        let split_m = mind_map_metrics_for_split_col(280.0, 12);
+        assert_eq!(split_m.gap_x, SPLIT_BRANCH_GAP_X);
+        assert_eq!(SPLIT_BRANCH_GAP_X, 30.0);
+        assert_eq!(SPLIT_COL_GUTTER, 8.0);
+        assert!(
+            split_m.max_card_w + split_m.gap_x + split_m.child_max_card_w <= 280.0 - SHADOW_PAD + 0.1,
+            "root ({}) + gap ({}) + child ({}) must fit within split column width",
+            split_m.max_card_w,
+            split_m.gap_x,
+            split_m.child_max_card_w
+        );
+
+        let ctx = egui::Context::default();
+        crate::rtl_text::install_arabic_fonts(&ctx);
+        crate::theme::install(&ctx);
+
+        let mut data = AppData::default();
+        let mut pane = MainTaskPane::new("لوحة منقسمة");
+        for i in 1..=9 {
+            let title = if i == 6 {
+                "بسم الله الرحمن الرحيم".to_string()
+            } else {
+                format!("فرع رئيسي رقم {}", i)
+            };
+            let mut n = TaskNode::new(&title);
+            if i == 2 {
+                n.children
+                    .push(TaskNode::new(";koljm;' طويل جداً لاختبار التداخل بين الأعمدة"));
+            }
+            pane.subtasks.push(n);
+        }
+        data.current_day.panes.push(pane);
+
+        let mut app = WhiteboardApp::from_data(data);
+        app.show_quick_entry_modal = false;
+
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, vec2(700.0, 360.0)));
+        let _ = ctx.run(raw.clone(), |ctx| app.draw(ctx));
+        let out = ctx.run(raw, |ctx| app.draw(ctx));
+
+        // Locate the 1.0px #E2E8F0 center vertical divider.
+        let mid_x = out
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::LineSegment { points, stroke }
+                    if stroke.color == theme::SUBTLE_RULE
+                        && (stroke.width - 1.0).abs() < 0.05
+                        && (points[0].x - points[1].x).abs() < 0.1
+                        && (points[1].y - points[0].y).abs() > 40.0 =>
+                {
+                    Some(points[0].x)
+                }
+                _ => None,
+            })
+            .expect("expected 1.0px #E2E8F0 vertical divider between split columns");
+
+        // Every painted card rect and clip rect inside the columns must respect the 8.0px
+        // inner gutter on both sides of `mid_x` (never straddling `mid_x - 8 .. mid_x + 8`).
+        let gutter_left = mid_x - SPLIT_COL_GUTTER + 0.5;
+        let gutter_right = mid_x + SPLIT_COL_GUTTER - 0.5;
+        for clipped in &out.shapes {
+            if let egui::Shape::Rect(r) = &clipped.shape {
+                let is_card = r.fill == theme::DRAWER_BG
+                    || (r.stroke.color == theme::INK && (r.stroke.width - 1.5).abs() < 0.05)
+                    || (r.stroke.color == theme::SLATE && (r.stroke.width - 1.0).abs() < 0.05);
+                if is_card {
+                    let visible = r.rect.intersect(clipped.clip_rect);
+                    if visible.is_positive() {
+                        let crosses_gutter =
+                            visible.left() < gutter_right && visible.right() > gutter_left;
+                        assert!(
+                            !crosses_gutter,
+                            "card visible rect {visible:?} crossed the 16px center gutter [{gutter_left:.1}, {gutter_right:.1}] around mid_x={mid_x:.1}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Active child tree in Right Column stays expanded (never auto-collapsed).
+        assert!(
+            !app.data.current_day.panes[0].subtasks[1].collapsed,
+            "active child branch must remain expanded"
+        );
+    }
+
+    #[test]
+    fn split_column_scroll_area_reserves_bottom_shadow_and_padding() {
+        let ctx = egui::Context::default();
+        crate::rtl_text::install_arabic_fonts(&ctx);
+        crate::theme::install(&ctx);
+
+        let mut data = AppData::default();
+        let mut pane = MainTaskPane::new("لوحة عميقة");
+        for i in 1..=14 {
+            pane.subtasks.push(TaskNode::new(&format!("مهمة رقم {:02}", i)));
+        }
+        data.current_day.panes.push(pane);
+
+        let mut app = WhiteboardApp::from_data(data);
+        app.show_quick_entry_modal = false;
+
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 320.0)));
+        let _ = ctx.run(raw.clone(), |ctx| app.draw(ctx));
+        let out = ctx.run(raw, |ctx| app.draw(ctx));
+
+        // Verify the bottom card in the scrollable column does NOT get painted below its
+        // clipped ScrollArea (all card clip rects stay above the 38px bottom input strip).
+        let input_border_y = out
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Rect(r)
+                    if r.fill == theme::SUBTLE_RULE
+                        && (r.rect.height() - 1.0).abs() < 0.05
+                        && r.rect.width() > 300.0 =>
+                {
+                    Some(r.rect.top())
+                }
+                _ => None,
+            })
+            .expect("expected bottom input strip top border");
+
+        for clipped in &out.shapes {
+            if let egui::Shape::Rect(r) = &clipped.shape {
+                if r.stroke.color == theme::INK && (r.stroke.width - 1.5).abs() < 0.05 {
+                    assert!(
+                        clipped.clip_rect.bottom() <= input_border_y + 0.5,
+                        "card clip rect bottom ({}) must stay strictly above bottom input strip ({})",
+                        clipped.clip_rect.bottom(),
+                        input_border_y
+                    );
+                }
+            }
+        }
+
+        // Scroll the Left Column all the way down and verify the last card (`14`) is fully visible
+        // with its 3.0px shadow + 12.0px bottom padding above `input_border_y`.
+        let mut scroll_raw = egui::RawInput::default();
+        scroll_raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 320.0)));
+        scroll_raw
+            .events
+            .push(egui::Event::PointerMoved(pos2(200.0, 180.0)));
+        scroll_raw.events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, -2000.0),
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(scroll_raw.clone(), |ctx| app.draw(ctx));
+        let scrolled_out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 320.0))),
+                ..Default::default()
+            },
+            |ctx| app.draw(ctx),
+        );
+
+        let last_card_bottom = scrolled_out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Rect(r)
+                    if r.stroke.color == theme::INK
+                        && (r.stroke.width - 1.5).abs() < 0.05
+                        && r.rect.right() < 400.0 =>
+                {
+                    Some(r.rect.bottom())
+                }
+                _ => None,
+            })
+            .fold(0.0_f32, f32::max);
+        assert!(
+            last_card_bottom > 0.0
+                && last_card_bottom + SHADOW_OFFSET.y + BOTTOM_SCROLL_PAD <= input_border_y + 1.0,
+            "scrolled bottom card ({last_card_bottom:.1}) + 3px shadow + 12px pad must fit cleanly above input strip ({input_border_y:.1})"
+        );
+    }
+
+    #[test]
+    fn sticky_hover_strip_bridge_and_180ms_grace_delay() {
+        let ctx = egui::Context::default();
+        crate::rtl_text::install_arabic_fonts(&ctx);
+        crate::theme::install(&ctx);
+
+        let mut app = WhiteboardApp::from_data(sample_data());
+        app.show_quick_entry_modal = false;
+        app.data.current_day.panes.truncate(1);
+        app.data.current_day.panes[0].subtasks[0].notes = "ملاحظة".to_string();
+        let node_id = app.data.current_day.panes[0].subtasks[0].id.clone();
+
+        let _ = ctx.run(Default::default(), |ctx| app.draw(ctx));
+        let idle = ctx.run(Default::default(), |ctx| app.draw(ctx));
+
+        let card_tl = idle
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Path(p)
+                    if p.closed
+                        && p.fill == theme::INK
+                        && p.points.len() == 3
+                        && (p.points[1].x - p.points[0].x - 8.0).abs() < 0.01 =>
+                {
+                    Some(p.points[0])
+                }
+                _ => None,
+            })
+            .expect("dog-ear triangle must locate card top-left");
+
+        // 1. Hover card body -> strip renders flush against card top edge (`strip.bottom == card_tl.y`).
+        let mut hover_card = egui::RawInput::default();
+        hover_card
+            .events
+            .push(egui::Event::PointerMoved(card_tl + vec2(30.0, 16.0)));
+        let out_card = ctx.run(hover_card, |ctx| app.draw(ctx));
+        let strip_rect = out_card
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Rect(r)
+                    if r.fill == theme::INK && (r.rect.height() - HOVER_STRIP_H).abs() < 0.05 =>
+                {
+                    Some(r.rect)
+                }
+                _ => None,
+            })
+            .expect("expected sticky hover strip when hovering card");
+        assert!(
+            (strip_rect.bottom() - card_tl.y).abs() < 0.05,
+            "strip must sit flush against card top edge with zero gap"
+        );
+        assert_eq!(
+            app.last_hovered_card.as_ref().map(|(id, _)| id.as_str()),
+            Some(node_id.as_str())
+        );
+
+        // 2. Move pointer into `card_rect.union(strip_rect).expand(4.0)` bridge (above card, slightly right of strip).
+        let mut hover_bridge = egui::RawInput::default();
+        hover_bridge
+            .events
+            .push(egui::Event::PointerMoved(pos2(strip_rect.right() + 2.0, card_tl.y - 6.0)));
+        let out_bridge = ctx.run(hover_bridge, |ctx| app.draw(ctx));
+        assert!(
+            rendered_text(&out_bridge).contains("≡"),
+            "strip must stay visible inside card.union(strip).expand(4.0) bridge zone"
+        );
+
+        // 3. Move pointer completely outside -> strip remains visible during the 180ms grace timer.
+        let mut hover_far = egui::RawInput::default();
+        hover_far
+            .events
+            .push(egui::Event::PointerMoved(pos2(5.0, 5.0)));
+        let out_grace = ctx.run(hover_far.clone(), |ctx| app.draw(ctx));
+        assert!(
+            rendered_text(&out_grace).contains("≡"),
+            "strip must stay visible during the 180ms grace window after leaving"
+        );
+        assert!(
+            app.last_hovered_card.is_some(),
+            "last_hovered_card must stay active during 180ms grace window"
+        );
+
+        // 4. After 180ms elapses, strip dismisses cleanly.
+        app.last_hovered_card = Some((node_id, Instant::now() - Duration::from_millis(220)));
+        let out_expired = ctx.run(hover_far, |ctx| app.draw(ctx));
+        assert!(
+            !rendered_text(&out_expired).contains("≡"),
+            "strip must dismiss cleanly once the 180ms grace timer expires"
+        );
+        assert!(app.last_hovered_card.is_none());
+    }
+
+    #[test]
+    fn top_bar_tabs_single_click_immediately_and_page_keys_work_while_input_focused() {
+        let ctx = egui::Context::default();
+        crate::rtl_text::install_arabic_fonts(&ctx);
+        crate::theme::install(&ctx);
+
+        let mut data = AppData::default();
+        for i in 1..=5 {
+            data.current_day.panes.push(MainTaskPane::new(&format!("مهمة {}", i)));
+        }
+        let pane0_id = data.current_day.panes[0].id.clone();
+        let mut app = WhiteboardApp::from_data(data);
+        app.show_quick_entry_modal = false;
+
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 600.0)));
+        let _ = ctx.run(raw.clone(), |ctx| app.draw(ctx));
+        let out_home = ctx.run(raw.clone(), |ctx| app.draw(ctx));
+
+        // Active HOME tab displays a crisp 2.0px #0F172A underline at bottom of top bar.
+        let has_active_underline = out_home.shapes.iter().any(|c| match &c.shape {
+            egui::Shape::Rect(r) => {
+                r.fill == theme::INK
+                    && (r.rect.height() - 2.0).abs() < 0.05
+                    && r.rect.bottom() <= 36.5
+                    && r.rect.width() >= 30.0
+                    && r.rect.width() <= 100.0
+            }
+            _ => false,
+        });
+        assert!(has_active_underline, "expected 2.0px #0F172A active underline on HOME tab");
+
+        // Even while the live bottom branch TextEdit has keyboard focus on HOME,
+        // PageDown flips immediately to page 2.
+        let input_id = Id::new(("pane_branch_input", pane0_id.as_str()));
+        ctx.memory_mut(|m| m.request_focus(input_id));
+        let mut pgdn = raw.clone();
+        pgdn.events.push(egui::Event::Key {
+            key: Key::PageDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(pgdn, |ctx| app.draw(ctx));
+        assert_eq!(
+            app.current_page, 1,
+            "PageDown must flip pages immediately from anywhere on HOME"
+        );
+
+        // Single-clicking the `INDEX` tab switches immediately on the very first click.
+        let index_pos = out_home
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == "INDEX" => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("INDEX tab must be rendered in top bar");
+
+        let click_at = |pos: Pos2, app: &mut WhiteboardApp| {
+            let mut down = raw.clone();
+            down.events.push(egui::Event::PointerMoved(pos));
+            down.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let _ = ctx.run(down, |ctx| app.draw(ctx));
+
+            let mut up = raw.clone();
+            up.events.push(egui::Event::PointerMoved(pos));
+            up.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            ctx.run(up, |ctx| app.draw(ctx))
+        };
+
+        let out_index = click_at(index_pos, &mut app);
+        assert!(
+            app.show_master_index && app.active_mode == AppMode::LiveBoard,
+            "single-clicking INDEX must open Master Index on the first click"
+        );
+        let idx_text = rendered_text(&out_index);
+        assert!(!idx_text.contains('✕'), "broken ✕ glyph must not exist in INDEX");
+        assert!(!idx_text.contains('✎'), "broken ✎ glyph must not exist in INDEX");
+        assert!(idx_text.contains(&shape_arabic("أرشفة")), "expected أرشفة action in INDEX");
+        assert!(idx_text.contains(&shape_arabic("حذف")), "expected حذف action in INDEX");
+        assert!(idx_text.contains(&shape_arabic("تعديل")), "expected تعديل action in INDEX");
+
+        // Single-clicking `HARBOR` switches immediately.
+        let harbor_pos = out_index
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == "HARBOR" => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("HARBOR tab must be rendered in top bar");
+        let _ = click_at(harbor_pos, &mut app);
+        assert_eq!(app.active_mode, AppMode::Harbor);
+        assert!(!app.show_master_index);
+
+        // Single-clicking `HOME` switches back immediately.
+        let home_pos = out_index
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == "HOME" => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("HOME tab must be rendered in top bar");
+        let _ = click_at(home_pos, &mut app);
+        assert_eq!(app.active_mode, AppMode::LiveBoard);
+        assert!(!app.show_master_index);
+    }
+
+    #[test]
+    fn index_row_selection_keyboard_reorder_inline_rename_and_archive() {
+        let ctx = egui::Context::default();
+        crate::rtl_text::install_arabic_fonts(&ctx);
+        crate::theme::install(&ctx);
+
+        let mut data = AppData::default();
+        for i in 1..=5 {
+            data.current_day
+                .panes
+                .push(MainTaskPane::new(&format!("Pane {}", i)));
+        }
+        let pane4_id = data.current_day.panes[3].id.clone();
+        let mut app = WhiteboardApp::from_data(data);
+        app.show_quick_entry_modal = false;
+        app.show_master_index = true;
+        app.index_selected_pane_id = Some(pane4_id.clone());
+
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 640.0)));
+        let out_sel = ctx.run(raw.clone(), |ctx| app.draw(ctx));
+
+        // Selected row renders #F1F5F9 fill + 1.5px #0F172A border.
+        let has_sel_fill = out_sel.shapes.iter().any(|c| match &c.shape {
+            egui::Shape::Rect(r) => r.fill == theme::SEL_FILL && (r.rect.height() - 46.0).abs() < 0.5,
+            _ => false,
+        });
+        let has_sel_border = out_sel.shapes.iter().any(|c| match &c.shape {
+            egui::Shape::Rect(r) => {
+                r.stroke.color == theme::INK
+                    && (r.stroke.width - 1.5).abs() < 0.05
+                    && (r.rect.height() - 46.0).abs() < 0.5
+            }
+            _ => false,
+        });
+        assert!(has_sel_fill && has_sel_border, "selected INDEX row must show #F1F5F9 fill + 1.5px #0F172A border");
+
+        // Pressing Down arrow moves Pane 4 (index 3, end of Page 1) across page boundary to index 4 (Page 2).
+        let mut down_key = raw.clone();
+        down_key.events.push(egui::Event::Key {
+            key: Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(down_key, |ctx| app.draw(ctx));
+        assert_eq!(app.data.current_day.panes[4].id, pane4_id);
+
+        // Pressing Up arrow moves it right back to index 3.
+        let mut up_key = raw.clone();
+        up_key.events.push(egui::Event::Key {
+            key: Key::ArrowUp,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(up_key, |ctx| app.draw(ctx));
+        assert_eq!(app.data.current_day.panes[3].id, pane4_id);
+
+        // Pressing F2 enters inline rename; modifying title then pressing Esc restores original title.
+        let mut f2_key = raw.clone();
+        f2_key.events.push(egui::Event::Key {
+            key: Key::F2,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(f2_key, |ctx| app.draw(ctx));
+        assert_eq!(app.index_editing_pane_id.as_deref(), Some(pane4_id.as_str()));
+        app.data.current_day.panes[3].title = "تغيير مؤقت".to_string();
+
+        let mut esc_key = raw.clone();
+        esc_key.events.push(egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(esc_key, |ctx| app.draw(ctx));
+        assert!(app.index_editing_pane_id.is_none());
+        assert_eq!(
+            app.data.current_day.panes[3].title, "Pane 4",
+            "pressing Esc during inline rename must restore original title"
+        );
+
+        // Archiving moves pane into Harbor archive and Ctrl+Z restores it cleanly.
+        app.archive_pane_at(3, Some(&ctx));
+        assert_eq!(app.data.current_day.panes.len(), 4);
+        assert_eq!(app.data.archived_panes.len(), 1);
+        assert_eq!(app.data.archived_panes[0].id, pane4_id);
+        assert!(app.undo(Some(&ctx)));
+        assert_eq!(app.data.current_day.panes.len(), 5);
+        assert!(app.data.archived_panes.is_empty());
+    }
+
+    #[test]
+    fn note_drawer_aligns_arabic_flush_right_places_rtl_caret_and_has_clean_copy() {
+        let ctx = egui::Context::default();
+        crate::rtl_text::install_arabic_fonts(&ctx);
+        crate::theme::install(&ctx);
+
+        let mut app = WhiteboardApp::from_data(sample_data());
+        app.show_quick_entry_modal = false;
+        app.data.current_day.panes.truncate(1);
+        let node_id = app.data.current_day.panes[0].subtasks[0].id.clone();
+        let logical_note = "سطر عربي أول\nسطر ثاني أطول قليلاً";
+        app.data.current_day.panes[0].subtasks[0].notes = logical_note.to_string();
+        app.open_note_drawer(node_id.clone(), true);
+
+        let mut raw = egui::RawInput::default();
+        raw.focused = true;
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 600.0)));
+        let _ = ctx.run(raw.clone(), |ctx| app.draw(ctx));
+        let out = ctx.run(raw, |ctx| app.draw(ctx));
+
+        // 1. Mutable logical buffer must NEVER be mutated with reordered bidi glyphs.
+        assert_eq!(
+            app.data.current_day.panes[0].subtasks[0].notes,
+            logical_note
+        );
+
+        // 2. Clean COPY button renders with NO tiny 7x8 square icon box next to it.
+        assert!(rendered_text(&out).contains("COPY"));
+        let has_tiny_copy_box = out.shapes.iter().any(|c| match &c.shape {
+            egui::Shape::Rect(r) => {
+                (r.rect.width() - 7.0).abs() < 0.2 && (r.rect.height() - 8.0).abs() < 0.2
+            }
+            _ => false,
+        });
+        assert!(!has_tiny_copy_box, "tiny square icon next to COPY must be removed");
+
+        // 3. Locate the #F8FAFC paper card rect and verify Arabic lines sit flush against right 16.0px padding.
+        let paper_rect = out
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Rect(r)
+                    if r.fill == theme::DRAWER_BG && r.rect.width() > 400.0 =>
+                {
+                    Some(r.rect)
+                }
+                _ => None,
+            })
+            .expect("expected #F8FAFC architectural note card");
+
+        let expected_right = paper_rect.right() - 1.5 - 16.0;
+        let note_text_shape = out
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.rows.len() >= 2 => Some(t),
+                _ => None,
+            })
+            .expect("expected multiline Arabic galley in note drawer");
+        for (i, row) in note_text_shape.galley.rows.iter().enumerate() {
+            let row_right = note_text_shape.pos.x + row.rect().max.x;
+            assert!(
+                (row_right - expected_right).abs() <= 4.0,
+                "Arabic note row {i} right edge ({row_right:.1}) must sit flush against right 16px padding ({expected_right:.1})"
+            );
+        }
+
+        // 4. Verify multiline RTL cursor mapping places end-of-line cursor at left edge (visual col 0).
+        let shaped = shape_arabic("مرحبا");
+        assert_eq!(rtl_multiline_visual_cursor_index("مرحبا", &shaped, 5), 0);
+        assert_eq!(rtl_multiline_visual_cursor_index("مرحبا", &shaped, 0), 5);
+        let two_lines_shaped = format!("{}\n{}", shape_arabic("مرحبا"), shape_arabic("عالم"));
+        assert_eq!(
+            rtl_multiline_visual_cursor_index("مرحبا\nعالم", &two_lines_shaped, 10),
+            6
         );
     }
 }
