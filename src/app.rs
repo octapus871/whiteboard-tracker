@@ -1,4 +1,4 @@
-use crate::models::{AppData, MainTaskPane, TaskNode, TaskStatus};
+use crate::models::{AppData, CardStamp, DayProfile, MainTaskPane, TaskNode, TaskStatus};
 use crate::rtl_text::shape_arabic;
 use crate::storage::save_app_data;
 use crate::theme;
@@ -78,6 +78,15 @@ pub struct WhiteboardApp {
     /// Parent nodes explicitly expanded by the user (immune to auto-collapse).
     pub manually_expanded_nodes: HashSet<String>,
 
+    /// When true, the chronological Daily Profiles manager modal is open.
+    pub show_profiles_modal: bool,
+    /// Profile awaiting a 2nd click ("تأكيد؟") before deletion.
+    pub profile_confirm_delete_id: Option<String>,
+    /// Newly created profile ID whose inline title `TextEdit` should grab focus next frame.
+    pub profile_focus_title_id: Option<String>,
+    /// When true, the calm Swiss First-Run Quick Guide modal is displayed.
+    pub show_onboarding_modal: bool,
+
     pub active_mode: AppMode,
     pub dirty: bool,
 }
@@ -113,8 +122,10 @@ impl WhiteboardApp {
         Self::from_data(data)
     }
 
-    pub fn from_data(data: AppData) -> Self {
-        let show_quick_entry_modal = data.current_day.panes.is_empty();
+    pub fn from_data(mut data: AppData) -> Self {
+        data.ensure_profiles_initialized();
+        let show_onboarding_modal = !data.has_seen_onboarding;
+        let show_quick_entry_modal = data.current_day.panes.is_empty() && !show_onboarding_modal;
 
         Self {
             data,
@@ -148,6 +159,10 @@ impl WhiteboardApp {
             last_frame_time: 0.0,
             last_hovered_card: None,
             manually_expanded_nodes: HashSet::new(),
+            show_profiles_modal: false,
+            profile_confirm_delete_id: None,
+            profile_focus_title_id: None,
+            show_onboarding_modal,
             active_mode: AppMode::LiveBoard,
             dirty: false,
         }
@@ -155,6 +170,7 @@ impl WhiteboardApp {
 
     pub fn auto_save(&mut self) {
         if self.dirty {
+            self.data.sync_active_profile_from_current_day();
             if let Err(e) = save_app_data(&self.data) {
                 eprintln!("Error saving data: {}", e);
             } else {
@@ -235,6 +251,152 @@ impl WhiteboardApp {
             set_status_in_nodes(&mut pane.subtasks, &target, status);
         }
         self.mark_dirty();
+    }
+
+    /// Cycles the subtle geometric watermark stamp on a single task node
+    /// (`None -> Dog -> Cat -> Duck -> Bird -> Star -> None`) with undo tracking.
+    pub fn cycle_node_stamp(&mut self, node_id: &str) {
+        self.push_undo_snapshot();
+        for pane in &mut self.data.current_day.panes {
+            if let Some(node) = find_node_in_slice_mut(&mut pane.subtasks, node_id) {
+                node.stamp = CardStamp::next_option(node.stamp);
+                self.mark_dirty();
+                return;
+            }
+        }
+    }
+
+    /// Returns the active profile's ISO date string (`YYYY-MM-DD`).
+    pub fn active_profile_date(&self) -> &str {
+        self.data
+            .profiles
+            .get(self.data.active_profile_idx)
+            .map(|p| p.date_str.as_str())
+            .unwrap_or(self.data.current_day.date_iso.as_str())
+    }
+
+    /// Loads `profiles[idx]` into `current_day` without overwriting `profiles[idx]`
+    /// with the previously active profile's panes.
+    fn load_profile_into_canvas(&mut self, idx: usize, ctx: Option<&egui::Context>) {
+        if idx >= self.data.profiles.len() {
+            return;
+        }
+        self.close_all_note_drawers(ctx);
+        self.data.active_profile_idx = idx;
+        self.data.current_day.panes = self.data.profiles[idx].panes.clone();
+        self.data.current_day.date_iso = self.data.profiles[idx].date_str.clone();
+        self.current_page = 0;
+        self.focused_pane_id = None;
+        self.focused_node_id = None;
+        self.editing_node_id = None;
+        self.selected_node_ids.clear();
+        self.selected_pane_ids.clear();
+        self.pane_inputs.clear();
+        self.scroll_seeded.clear();
+        self.index_selected_pane_id = None;
+        self.index_confirm_delete_pane_id = None;
+        self.index_editing_pane_id = None;
+        self.index_edit_backup_title = None;
+        self.profile_confirm_delete_id = None;
+        self.mark_dirty();
+        self.auto_save();
+    }
+
+    /// Switches the active board to `profiles[idx]`, persisting current panes first.
+    pub fn switch_to_profile(&mut self, idx: usize, ctx: Option<&egui::Context>) {
+        if idx >= self.data.profiles.len() {
+            return;
+        }
+        self.data.sync_active_profile_from_current_day();
+        self.load_profile_into_canvas(idx, ctx);
+    }
+
+    /// Creates a brand-new blank chronological daily profile for today (placed at
+    /// index 0, newest first, with empty `panes: Vec::new()` — never cloning the
+    /// active profile's tasks), activates it, and queues focus on its inline title editor.
+    pub fn create_new_profile(&mut self, ctx: Option<&egui::Context>) -> String {
+        self.data.sync_active_profile_from_current_day();
+        let mut new_profile = DayProfile::new_for_today(Vec::new());
+        let max_ts = self
+            .data
+            .profiles
+            .iter()
+            .map(|p| p.created_ts)
+            .max()
+            .unwrap_or(new_profile.created_ts);
+        if new_profile.created_ts <= max_ts {
+            new_profile.created_ts = max_ts + 1;
+        }
+        let new_id = new_profile.id.clone();
+        self.data.profiles.insert(0, new_profile);
+        self.load_profile_into_canvas(0, ctx);
+        self.profile_focus_title_id = Some(new_id.clone());
+        new_id
+    }
+
+    /// Deletes the profile at `idx` (refuses to delete if only 1 profile remains).
+    pub fn delete_profile_at(&mut self, idx: usize, ctx: Option<&egui::Context>) {
+        if self.data.profiles.len() <= 1 || idx >= self.data.profiles.len() {
+            return;
+        }
+        self.data.sync_active_profile_from_current_day();
+        let was_active = idx == self.data.active_profile_idx;
+        let removed = self.data.profiles.remove(idx);
+        if self.profile_confirm_delete_id.as_deref() == Some(removed.id.as_str()) {
+            self.profile_confirm_delete_id = None;
+        }
+        if self.profile_focus_title_id.as_deref() == Some(removed.id.as_str()) {
+            self.profile_focus_title_id = None;
+        }
+        if was_active {
+            let next_idx = idx.min(self.data.profiles.len() - 1);
+            self.load_profile_into_canvas(next_idx, ctx);
+        } else {
+            if idx < self.data.active_profile_idx {
+                self.data.active_profile_idx -= 1;
+            }
+            self.mark_dirty();
+            self.auto_save();
+        }
+    }
+
+    /// Copies only non-completed, non-cancelled active items from the previous
+    /// chronological profile (`active_profile_idx + 1`, or nearest other profile)
+    /// into the active profile, pushing an Undo snapshot first.
+    pub fn carry_over_active_from_previous(&mut self, ctx: Option<&egui::Context>) -> usize {
+        self.data.sync_active_profile_from_current_day();
+        let prev_idx = if self.data.active_profile_idx + 1 < self.data.profiles.len() {
+            Some(self.data.active_profile_idx + 1)
+        } else if self.data.active_profile_idx > 0 {
+            Some(self.data.active_profile_idx - 1)
+        } else {
+            None
+        };
+        let Some(prev_idx) = prev_idx else {
+            return 0;
+        };
+        let carried: Vec<MainTaskPane> = self.data.profiles[prev_idx]
+            .panes
+            .iter()
+            .filter_map(MainTaskPane::clone_active_only)
+            .collect();
+        let count = carried.len();
+        if count == 0 {
+            return 0;
+        }
+        self.push_undo_snapshot();
+        self.data.current_day.panes.extend(carried);
+        self.data.sync_active_profile_from_current_day();
+        let now = ctx
+            .map(|c| c.input(|i| i.time))
+            .unwrap_or(self.last_frame_time);
+        self.undo_toast = Some((
+            format!("تم ترحيل {} لوحات نشطة", count),
+            now + UNDO_TOAST_DURATION_SECS,
+        ));
+        self.mark_dirty();
+        self.auto_save();
+        count
     }
 
     /// Appends a new top-level branch to the specified pane with undo tracking.
@@ -539,28 +701,29 @@ impl WhiteboardApp {
     // ---------------------------------------------------------------------
 
     fn handle_keyboard_navigation(&mut self, ctx: &egui::Context) {
-        if self.show_quick_entry_modal {
+        if self.show_quick_entry_modal || self.show_profiles_modal || self.show_onboarding_modal {
             return;
         }
 
-        // On HOME, PageUp / PageDown and Alt+Left / Alt+Right flip pages immediately
-        // from anywhere (even while the live bottom branch input retains focus), as
-        // long as a card title isn't actively being renamed inline.
+        // On HOME, PageUp / PageDown, Alt+Left/Right, and Ctrl+Left/Right flip pages
+        // immediately from anywhere (even while the live bottom branch input retains
+        // focus), as long as a card title isn't actively being renamed inline.
         let on_home = self.active_mode == AppMode::LiveBoard && !self.show_master_index;
-        let (page_up, page_down, alt_left, alt_right) = ctx.input(|i| {
+        let (page_up, page_down, nav_left, nav_right) = ctx.input(|i| {
+            let nav_mod = i.modifiers.alt || i.modifiers.ctrl || i.modifiers.command;
             (
                 i.key_pressed(Key::PageUp),
                 i.key_pressed(Key::PageDown),
-                i.modifiers.alt && i.key_pressed(Key::ArrowLeft),
-                i.modifiers.alt && i.key_pressed(Key::ArrowRight),
+                nav_mod && i.key_pressed(Key::ArrowLeft),
+                nav_mod && i.key_pressed(Key::ArrowRight),
             )
         });
         if on_home && self.editing_node_id.is_none() {
-            if page_up || alt_left {
+            if page_up || nav_left {
                 self.prev_page();
                 return;
             }
-            if page_down || alt_right {
+            if page_down || nav_right {
                 self.next_page();
                 return;
             }
@@ -570,11 +733,11 @@ impl WhiteboardApp {
             return;
         }
 
-        if page_up || alt_left {
+        if page_up || nav_left {
             self.prev_page();
             return;
         }
-        if page_down || alt_right {
+        if page_down || nav_right {
             self.next_page();
             return;
         }
@@ -910,7 +1073,14 @@ impl WhiteboardApp {
         // Escape always works - even while a text field has focus - so an
         // edit can be cancelled (and an empty new node removed again).
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            if self.show_quick_entry_modal {
+            if self.show_profiles_modal {
+                self.show_profiles_modal = false;
+                self.profile_confirm_delete_id = None;
+            } else if self.show_onboarding_modal {
+                self.show_onboarding_modal = false;
+                self.data.has_seen_onboarding = true;
+                self.mark_dirty();
+            } else if self.show_quick_entry_modal {
                 self.show_quick_entry_modal = false;
                 self.focus_quick_entry = false;
             } else if let Some(edit_id) = self.index_editing_pane_id.take() {
@@ -957,12 +1127,16 @@ impl WhiteboardApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 } else if zen_toggle {
                     self.is_zen = !self.is_zen;
-                } else if undo_shortcut && !self.show_quick_entry_modal {
+                } else if undo_shortcut
+                    && !self.show_quick_entry_modal
+                    && !self.show_profiles_modal
+                    && !self.show_onboarding_modal
+                {
                     self.undo(Some(ctx));
                 }
             }
 
-            if !self.show_master_index {
+            if !self.show_master_index && !self.show_profiles_modal && !self.show_onboarding_modal {
                 self.handle_pane_hotkeys(ctx);
             }
         }
@@ -1021,8 +1195,14 @@ impl WhiteboardApp {
                 });
         }
 
-        if self.show_quick_entry_modal {
+        if self.show_quick_entry_modal && !self.show_onboarding_modal {
             self.render_quick_entry_modal(ctx);
+        }
+        if self.show_profiles_modal {
+            self.render_profiles_modal(ctx);
+        }
+        if self.show_onboarding_modal {
+            self.render_onboarding_modal(ctx);
         }
 
         if self.dirty {
@@ -1033,42 +1213,39 @@ impl WhiteboardApp {
 
 impl WhiteboardApp {
     /// Ultra-minimalist single-line top bar: explicit `HOME | INDEX | HARBOR` tabs
-    /// on the left (crisp `2.0px` `#0F172A` active underline, single-click immediate),
-    /// centered `‹ PAGE 1 / N ›` page navigator, and clock + window controls on
-    /// the right, over a 1px black hairline.
+    /// + `[ YYYY-MM-DD ▾ ]` profile pill on the left (crisp `2.0px` `#0F172A` active
+    /// underline, instant first-click response), centered `‹ PAGE 1 / N ›` page
+    /// navigator, and clock + window controls on the right, over a 1px black hairline.
+    /// Window dragging (`ViewportCommand::StartDrag`) is strictly limited to empty
+    /// whitespace gaps between clusters so it never intercepts button clicks.
     fn render_top_bar(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let bar_rect = ui.max_rect();
         let total_pages = self.total_pages();
+        let primary_released = ctx.input(|i| i.pointer.primary_released());
+        let activated = |r: &egui::Response| r.clicked() || (r.hovered() && primary_released);
 
-        // Background drag region sits behind interactive controls; only starts a
-        // window drag if no interactive top-bar control is hovered so single clicks
-        // on `HOME`, `INDEX`, `HARBOR`, `‹`, `›` always fire immediately.
-        let drag_response = ui.interact(bar_rect, ui.id().with("top_bar_drag"), Sense::drag());
         let mut any_control_hovered = false;
         let mut surrender_focus = false;
 
-        // Left navigation: `HOME | INDEX | HARBOR` (or `← BACK [Esc]` when maximized).
-        let left_rect = Rect::from_min_max(
-            bar_rect.left_top(),
-            pos2(
-                (bar_rect.center().x - 108.0).max(bar_rect.left() + 240.0),
-                bar_rect.bottom(),
-            ),
-        );
+        // Left navigation: `HOME | INDEX | HARBOR` + `[ YYYY-MM-DD ▾ ]` profile pill
+        // (or `← BACK [Esc]` when maximized).
+        let left_end = (bar_rect.center().x - 102.0).max(bar_rect.left() + 365.0);
+        let left_rect = Rect::from_min_max(bar_rect.left_top(), pos2(left_end, bar_rect.bottom()));
         let mut left_ui = ui.new_child(
             UiBuilder::new()
                 .max_rect(left_rect)
                 .layout(Layout::left_to_right(Align::Center)),
         );
         left_ui.spacing_mut().item_spacing.x = 6.0;
-        if self.focused_pane_id.is_some() {
+        let left_used_right = if self.focused_pane_id.is_some() {
             let back_resp = top_bar_tab(&mut left_ui, "← BACK [Esc]", true);
             any_control_hovered |= back_resp.hovered();
-            if back_resp.clicked() {
+            if activated(&back_resp) {
                 self.focused_pane_id = None;
                 surrender_focus = true;
             }
+            back_resp.rect.right()
         } else {
             let home_active = self.active_mode == AppMode::LiveBoard && !self.show_master_index;
             let index_active = self.active_mode == AppMode::LiveBoard && self.show_master_index;
@@ -1077,7 +1254,7 @@ impl WhiteboardApp {
             let home_resp = top_bar_tab(&mut left_ui, "HOME", home_active)
                 .on_hover_text("ACTIVE 4-PANE BOARD");
             any_control_hovered |= home_resp.hovered();
-            if home_resp.clicked() {
+            if activated(&home_resp) {
                 self.active_mode = AppMode::LiveBoard;
                 self.show_master_index = false;
                 self.focused_pane_id = None;
@@ -1092,7 +1269,7 @@ impl WhiteboardApp {
             let index_resp = top_bar_tab(&mut left_ui, "INDEX", index_active)
                 .on_hover_text("MASTER INDEX");
             any_control_hovered |= index_resp.hovered();
-            if index_resp.clicked() {
+            if activated(&index_resp) {
                 self.active_mode = AppMode::LiveBoard;
                 self.show_master_index = true;
                 self.focused_pane_id = None;
@@ -1107,7 +1284,7 @@ impl WhiteboardApp {
             let harbor_resp = top_bar_tab(&mut left_ui, "HARBOR", harbor_active)
                 .on_hover_text("ARCHIVE & REPORTS");
             any_control_hovered |= harbor_resp.hovered();
-            if harbor_resp.clicked() {
+            if activated(&harbor_resp) {
                 self.active_mode = AppMode::Harbor;
                 self.show_master_index = false;
                 self.focused_pane_id = None;
@@ -1116,12 +1293,30 @@ impl WhiteboardApp {
                 self.index_edit_backup_title = None;
                 surrender_focus = true;
             }
-        }
 
-        // Center page navigator: `‹ PAGE 1 / N ›` with generous 28x28 hitboxes.
-        let center_w = 210.0;
+            left_ui.add_space(6.0);
+            let date_str = self.active_profile_date().to_string();
+            let pill_resp = profile_selector_pill(&mut left_ui, &date_str, self.show_profiles_modal)
+                .on_hover_text("DAILY PROFILES [PROFILES]");
+            any_control_hovered |= pill_resp.hovered();
+            if activated(&pill_resp) {
+                self.data.sync_active_profile_from_current_day();
+                self.show_profiles_modal = !self.show_profiles_modal;
+                self.profile_confirm_delete_id = None;
+                surrender_focus = true;
+            }
+            pill_resp.rect.right()
+        };
+
+        // Center page navigator: `‹ PAGE 1 / N ›` with generous 28x28 hitboxes and
+        // clickable `PAGE 1 / N` label to advance pages cleanly.
+        let center_w = 196.0;
+        let center_x = bar_rect
+            .center()
+            .x
+            .max(left_used_right + center_w * 0.5 + 8.0);
         let center_rect = Rect::from_center_size(
-            bar_rect.center(),
+            pos2(center_x, bar_rect.center().y),
             vec2(center_w, bar_rect.height()),
         );
         let mut center_ui = ui.new_child(
@@ -1129,68 +1324,124 @@ impl WhiteboardApp {
                 .max_rect(center_rect)
                 .layout(Layout::left_to_right(Align::Center)),
         );
-        center_ui.with_layout(Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
-            ui.horizontal_centered(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let can_prev = self.current_page > 0;
-                let can_next = self.current_page + 1 < total_pages;
+        let mut center_used_rect = center_rect;
+        center_ui.with_layout(
+            Layout::centered_and_justified(egui::Direction::LeftToRight),
+            |ui| {
+                let row = ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let can_prev = self.current_page > 0;
+                    let can_next = self.current_page + 1 < total_pages;
 
-                let (prev_rect, prev_resp) = ui.allocate_exact_size(
-                    vec2(MIN_HITBOX_SIZE, MIN_HITBOX_SIZE),
-                    Sense::click(),
-                );
-                let prev_resp = prev_resp
-                    .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text("PREVIOUS PAGE [PageUp / Alt+Left]");
-                any_control_hovered |= prev_resp.hovered();
-                let prev_color = if can_prev { theme::INK } else { theme::MUTED };
-                ui.painter().text(
-                    prev_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "‹",
-                    FontId::monospace(16.0),
-                    prev_color,
-                );
-                if prev_resp.clicked() && can_prev {
-                    self.prev_page();
-                    surrender_focus = true;
-                }
+                    let (prev_rect, prev_resp) = ui.allocate_exact_size(
+                        vec2(MIN_HITBOX_SIZE, MIN_HITBOX_SIZE),
+                        Sense::click(),
+                    );
+                    let prev_resp = prev_resp
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text("PREVIOUS PAGE [PageUp / Ctrl+Left / Alt+Left]");
+                    any_control_hovered |= prev_resp.hovered();
+                    let prev_color = if can_prev { theme::INK } else { theme::MUTED };
+                    if can_prev && prev_resp.hovered() {
+                        ui.painter().rect_filled(
+                            Rect::from_center_size(prev_rect.center(), vec2(22.0, 22.0)),
+                            CornerRadius::same(0),
+                            theme::SEL_FILL,
+                        );
+                    }
+                    ui.painter().text(
+                        prev_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "‹",
+                        FontId::monospace(16.0),
+                        prev_color,
+                    );
+                    if activated(&prev_resp) && can_prev {
+                        self.prev_page();
+                        surrender_focus = true;
+                    }
 
-                ui.label(
-                    mono(
-                        format!("PAGE {} / {}", self.current_page + 1, total_pages),
-                        13.5,
-                    )
-                    .strong()
-                    .color(theme::INK),
-                );
+                    let page_text = format!("PAGE {} / {}", self.current_page + 1, total_pages);
+                    let page_font = FontId::monospace(13.5);
+                    let page_text_w = ui
+                        .fonts_mut(|f| {
+                            f.layout_no_wrap(page_text.clone(), page_font.clone(), Color32::TRANSPARENT)
+                        })
+                        .size()
+                        .x;
+                    let (page_rect, page_resp) = ui.allocate_exact_size(
+                        vec2((page_text_w + 12.0).max(76.0), MIN_HITBOX_SIZE),
+                        Sense::click(),
+                    );
+                    let page_resp = page_resp
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text("CLICK: NEXT PAGE");
+                    any_control_hovered |= page_resp.hovered();
+                    if total_pages > 1 && page_resp.hovered() {
+                        ui.painter().rect_filled(
+                            Rect::from_center_size(page_rect.center(), vec2(page_rect.width(), 22.0)),
+                            CornerRadius::same(0),
+                            theme::SEL_FILL,
+                        );
+                    }
+                    ui.painter().text(
+                        page_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        &page_text,
+                        page_font.clone(),
+                        theme::INK,
+                    );
+                    ui.painter().text(
+                        page_rect.center() + vec2(0.45, 0.0),
+                        egui::Align2::CENTER_CENTER,
+                        &page_text,
+                        page_font,
+                        theme::INK,
+                    );
+                    if activated(&page_resp) && total_pages > 1 {
+                        self.current_page = (self.current_page + 1) % total_pages;
+                        self.focused_pane_id = None;
+                        surrender_focus = true;
+                    }
 
-                let (next_rect, next_resp) = ui.allocate_exact_size(
-                    vec2(MIN_HITBOX_SIZE, MIN_HITBOX_SIZE),
-                    Sense::click(),
-                );
-                let next_resp = next_resp
-                    .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text("NEXT PAGE [PageDown / Alt+Right]");
-                any_control_hovered |= next_resp.hovered();
-                let next_color = if can_next { theme::INK } else { theme::MUTED };
-                ui.painter().text(
-                    next_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "›",
-                    FontId::monospace(16.0),
-                    next_color,
-                );
-                if next_resp.clicked() && can_next {
-                    self.next_page();
-                    surrender_focus = true;
-                }
-            });
-        });
+                    let (next_rect, next_resp) = ui.allocate_exact_size(
+                        vec2(MIN_HITBOX_SIZE, MIN_HITBOX_SIZE),
+                        Sense::click(),
+                    );
+                    let next_resp = next_resp
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text("NEXT PAGE [PageDown / Ctrl+Right / Alt+Right]");
+                    any_control_hovered |= next_resp.hovered();
+                    let next_color = if can_next { theme::INK } else { theme::MUTED };
+                    if can_next && next_resp.hovered() {
+                        ui.painter().rect_filled(
+                            Rect::from_center_size(next_rect.center(), vec2(22.0, 22.0)),
+                            CornerRadius::same(0),
+                            theme::SEL_FILL,
+                        );
+                    }
+                    ui.painter().text(
+                        next_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "›",
+                        FontId::monospace(16.0),
+                        next_color,
+                    );
+                    if activated(&next_resp) && can_next {
+                        self.next_page();
+                        surrender_focus = true;
+                    }
+                });
+                center_used_rect = row.response.rect;
+            },
+        );
 
         // Right cluster: window controls + digital clock.
         let right_rect = Rect::from_min_max(
-            pos2((bar_rect.center().x + 108.0).min(bar_rect.right() - 180.0), bar_rect.top()),
+            pos2(
+                (center_rect.right() + 8.0).min(bar_rect.right() - 180.0),
+                bar_rect.top(),
+            ),
             bar_rect.right_bottom(),
         );
         let mut right_ui = ui.new_child(
@@ -1201,27 +1452,51 @@ impl WhiteboardApp {
         right_ui.spacing_mut().item_spacing.x = 12.0;
         let close_btn = window_control(&mut right_ui, "\u{d7}", "CLOSE");
         any_control_hovered |= close_btn.hovered();
-        if close_btn.clicked() {
+        if activated(&close_btn) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         let max_btn = window_control(&mut right_ui, "\u{25a1}", "MAXIMIZE");
         any_control_hovered |= max_btn.hovered();
-        if max_btn.clicked() {
+        if activated(&max_btn) {
             let maximized = ctx.input(|i| i.viewport().maximized).unwrap_or(false);
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
         }
         let min_btn = window_control(&mut right_ui, "\u{2014}", "MINIMIZE");
         any_control_hovered |= min_btn.hovered();
-        if min_btn.clicked() {
+        if activated(&min_btn) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
         right_ui.add_space(10.0);
         let (time, _date) = clock_strings();
         let short_date = short_date_string();
-        right_ui.label(mono(&time, 14.0).strong().color(theme::INK));
-        right_ui.label(mono(short_date, 12.5).color(theme::SLATE));
+        let time_resp = right_ui.label(mono(&time, 14.0).strong().color(theme::INK));
+        let date_resp = right_ui.label(mono(short_date, 12.5).color(theme::SLATE));
+        let right_used_left = date_resp.rect.left().min(time_resp.rect.left());
 
-        if drag_response.drag_started() && !any_control_hovered {
+        // Window dragging strictly on EMPTY top-bar whitespace gaps only — never
+        // overlapping any tab, profile pill, page arrow, or window button.
+        let gap_left_center = Rect::from_min_max(
+            pos2(left_used_right + 4.0, bar_rect.top()),
+            pos2(center_used_rect.left() - 4.0, bar_rect.bottom()),
+        );
+        let gap_center_right = Rect::from_min_max(
+            pos2(center_used_rect.right() + 4.0, bar_rect.top()),
+            pos2(right_used_left - 4.0, bar_rect.bottom()),
+        );
+        let mut start_drag = false;
+        for (slot, gap_rect) in [(0usize, gap_left_center), (1usize, gap_center_right)] {
+            if gap_rect.width() > 6.0 {
+                let drag_resp = ui.interact(
+                    gap_rect,
+                    ui.id().with(("top_bar_drag_gap", slot)),
+                    Sense::drag(),
+                );
+                if drag_resp.drag_started() && !any_control_hovered {
+                    start_drag = true;
+                }
+            }
+        }
+        if start_drag {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
         if surrender_focus {
@@ -1281,7 +1556,35 @@ impl WhiteboardApp {
             metric(ui, counts.total, theme::INK, "TOTAL");
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_space(24.0);
+                ui.add_space(16.0);
+                // Subtle `?` help button (28px hitbox) to reopen Quick Guide anytime.
+                let (help_rect, help_resp) =
+                    ui.allocate_exact_size(vec2(MIN_HITBOX_SIZE, 26.0), Sense::click());
+                let help_resp = help_resp
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text(shape_arabic("دليل الاستخدام السريع"));
+                let help_color = if help_resp.hovered() {
+                    theme::INK
+                } else {
+                    theme::SLATE
+                };
+                if help_resp.hovered() {
+                    let pill = Rect::from_center_size(help_rect.center(), vec2(20.0, 20.0));
+                    ui.painter()
+                        .rect_filled(pill, CornerRadius::same(0), theme::SEL_FILL);
+                }
+                ui.painter().text(
+                    help_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "?",
+                    FontId::monospace(13.0),
+                    help_color,
+                );
+                if help_resp.clicked() {
+                    self.show_onboarding_modal = true;
+                }
+
+                ui.add_space(6.0);
                 if self.dirty {
                     ui.label(mono("SAVING...", 12.5).strong().color(theme::AMBER_INK));
                 } else {
@@ -1395,6 +1698,558 @@ impl WhiteboardApp {
                     });
                 });
             });
+    }
+
+    /// Clean, centered `0.0px` Swiss architectural modal (`max_width: 640px`,
+    /// `1.5px` `#0F172A` border, `4.0px` shadow, `#FFFFFF` fill) listing
+    /// chronological daily profiles newest-first with inline title editing,
+    /// completion badges, `+ بروفايل جديد`, `ترحيل النشط من الأمس`, `تفعيل`,
+    /// and 2-click `حذف` (disabled when only 1 profile remains).
+    fn render_profiles_modal(&mut self, ctx: &egui::Context) {
+        let screen = ctx.viewport_rect();
+        let mut close_modal = false;
+        let mut create_new = false;
+        let mut carry_over = false;
+        let mut activate_idx: Option<usize> = None;
+        let mut delete_idx: Option<usize> = None;
+        let mut dirty = false;
+
+        let modal_w = (screen.width() - 48.0).clamp(360.0, 640.0);
+        let modal_h = (screen.height() - 96.0).clamp(280.0, 520.0);
+        let modal_rect = Rect::from_center_size(screen.center(), vec2(modal_w, modal_h));
+
+        // Dimmed backdrop: clicking outside `modal_rect` closes cleanly.
+        egui::Area::new(Id::new("profiles_modal_backdrop"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .default_size(screen.size())
+            .constrain(false)
+            .fade_in(false)
+            .show(ctx, |ui| {
+                let (_, bg_resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter().rect_filled(
+                    screen,
+                    CornerRadius::same(0),
+                    Color32::from_black_alpha(60),
+                );
+                // Absorb clicks inside `modal_rect` so clicking whitespace or dynamic rows
+                // inside the modal NEVER bubbles through to outside-click dismissal.
+                let _surface_resp = ui.interact(
+                    modal_rect,
+                    Id::new("profiles_modal_surface"),
+                    Sense::click(),
+                );
+                if bg_resp.clicked() {
+                    if let Some(pos) = bg_resp.interact_pointer_pos() {
+                        if !modal_rect.contains(pos) {
+                            close_modal = true;
+                        }
+                    }
+                }
+
+                // 4.0px solid #0F172A hard offset shadow + #FFFFFF 0.0px card + 1.5px #0F172A border.
+                ui.painter().rect_filled(
+                    modal_rect.translate(vec2(-4.0, 4.0)),
+                    CornerRadius::same(0),
+                    theme::INK,
+                );
+                ui.painter()
+                    .rect_filled(modal_rect, CornerRadius::same(0), theme::PANE);
+                ui.painter().rect_stroke(
+                    modal_rect,
+                    CornerRadius::same(0),
+                    Stroke::new(1.5, theme::INK),
+                    StrokeKind::Inside,
+                );
+
+                let inner = modal_rect.shrink(16.0);
+                let mut m_ui = ui.new_child(
+                    UiBuilder::new()
+                        .max_rect(inner)
+                        .layout(Layout::top_down(Align::Max)),
+                );
+                m_ui.set_clip_rect(inner);
+
+                // Top header: Arabic title on the right, `PROFILES` tag + crisp X close on the left.
+                rtl_row(&mut m_ui, 32.0, |ui| {
+                    ui.label(
+                        RichText::new(shape_arabic("البروفايلات اليومية"))
+                            .size(18.0)
+                            .strong()
+                            .color(theme::INK),
+                    );
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        let (x_rect, x_resp) = ui.allocate_exact_size(
+                            vec2(MIN_HITBOX_SIZE, MIN_HITBOX_SIZE),
+                            Sense::click(),
+                        );
+                        let x_resp = x_resp
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text("CLOSE [Esc]");
+                        let x_col = if x_resp.hovered() {
+                            theme::INK
+                        } else {
+                            theme::INK_SOFT
+                        };
+                        let c = x_rect.center();
+                        let s = Stroke::new(1.6, x_col);
+                        ui.painter()
+                            .line_segment([pos2(c.x - 5.0, c.y - 5.0), pos2(c.x + 5.0, c.y + 5.0)], s);
+                        ui.painter()
+                            .line_segment([pos2(c.x - 5.0, c.y + 5.0), pos2(c.x + 5.0, c.y - 5.0)], s);
+                        if x_resp.clicked() {
+                            close_modal = true;
+                        }
+                        ui.label(mono("PROFILES", 12.0).color(theme::SLATE));
+                    });
+                });
+
+                m_ui.add_space(10.0);
+
+                // Action bar: `+ بروفايل جديد` and `ترحيل النشط من الأمس`.
+                let has_previous = self.data.profiles.len() > 1;
+                rtl_row(&mut m_ui, 34.0, |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+
+                    let (new_rect, new_resp) =
+                        ui.allocate_exact_size(vec2(138.0, 32.0), Sense::click());
+                    let new_resp = new_resp.on_hover_cursor(CursorIcon::PointingHand);
+                    let new_bg = if new_resp.hovered() {
+                        theme::GRID
+                    } else {
+                        theme::INK
+                    };
+                    ui.painter()
+                        .rect_filled(new_rect, CornerRadius::same(0), new_bg);
+                    ui.painter().text(
+                        new_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        shape_arabic("+ بروفايل جديد"),
+                        FontId::proportional(13.5),
+                        theme::PANE,
+                    );
+                    if new_resp.clicked() {
+                        create_new = true;
+                    }
+
+                    let (carry_rect, carry_resp) =
+                        ui.allocate_exact_size(vec2(174.0, 32.0), Sense::click());
+                    let carry_resp = if has_previous {
+                        carry_resp.on_hover_cursor(CursorIcon::PointingHand)
+                    } else {
+                        carry_resp
+                    };
+                    let carry_bg = if has_previous && carry_resp.hovered() {
+                        theme::SEL_FILL
+                    } else {
+                        theme::PANE
+                    };
+                    let carry_border = if has_previous {
+                        theme::INK
+                    } else {
+                        theme::HINT
+                    };
+                    let carry_fg = if has_previous {
+                        theme::INK
+                    } else {
+                        theme::MUTED
+                    };
+                    ui.painter()
+                        .rect_filled(carry_rect, CornerRadius::same(0), carry_bg);
+                    ui.painter().rect_stroke(
+                        carry_rect,
+                        CornerRadius::same(0),
+                        Stroke::new(1.5, carry_border),
+                        StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        carry_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        shape_arabic("ترحيل النشط من الأمس"),
+                        FontId::proportional(13.5),
+                        carry_fg,
+                    );
+                    if carry_resp.clicked() && has_previous {
+                        carry_over = true;
+                    }
+                });
+
+                m_ui.add_space(10.0);
+                let (div_rect, _) =
+                    m_ui.allocate_exact_size(vec2(m_ui.available_width(), 1.0), Sense::hover());
+                m_ui.painter()
+                    .rect_filled(div_rect, CornerRadius::same(0), theme::SUBTLE_RULE);
+                m_ui.add_space(8.0);
+
+                // Chronological profile list (newest first).
+                let profile_count = self.data.profiles.len();
+                let active_idx = self.data.active_profile_idx;
+                let list_h = m_ui.available_height().max(80.0);
+                ScrollArea::vertical()
+                    .id_salt("profiles_modal_list")
+                    .auto_shrink([false, false])
+                    .max_height(list_h)
+                    .show(&mut m_ui, |ui| {
+                        for idx in 0..profile_count {
+                            let profile = &mut self.data.profiles[idx];
+                            let profile_id = profile.id.clone();
+                            let date_str = profile.date_str.clone();
+                            let (done, total) = profile.completion_counts();
+                            let is_active = idx == active_idx;
+                            let is_confirming_del = self
+                                .profile_confirm_delete_id
+                                .as_deref()
+                                == Some(profile_id.as_str());
+                            let can_delete = profile_count > 1;
+
+                            let row_w = ui.available_width();
+                            let (row_rect, _) =
+                                ui.allocate_exact_size(vec2(row_w, 48.0), Sense::hover());
+                            if is_active {
+                                ui.painter().rect_filled(
+                                    row_rect,
+                                    CornerRadius::same(0),
+                                    theme::SEL_FILL,
+                                );
+                                ui.painter().rect_stroke(
+                                    row_rect,
+                                    CornerRadius::same(0),
+                                    Stroke::new(1.5, theme::INK),
+                                    StrokeKind::Inside,
+                                );
+                            }
+
+                            let row_inner = row_rect.shrink2(vec2(8.0, 4.0));
+                            let mut row_ui = ui.new_child(
+                                UiBuilder::new()
+                                    .max_rect(row_inner)
+                                    .layout(Layout::right_to_left(Align::Center)),
+                            );
+                            row_ui.set_clip_rect(row_inner);
+                            row_ui.spacing_mut().item_spacing.x = 8.0;
+
+                            // Rightmost: Monospace Bold date string (`YYYY-MM-DD`).
+                            row_ui.label(mono(&date_str, 13.0).strong().color(theme::INK));
+
+                            // Inline-editable RTL profile title (`16.0px`).
+                            let controls_w = 195.0;
+                            let title_w = (row_ui.available_width() - controls_w).max(90.0);
+                            let edit_resp = rtl_text_edit(
+                                &mut row_ui,
+                                Id::new(("profile_title_edit", profile_id.as_str())),
+                                &mut profile.title,
+                                "عنوان اليوم...",
+                                16.0,
+                                title_w,
+                                Margin::symmetric(4, 2),
+                                theme::INK,
+                            )
+                            .response;
+                            if self.profile_focus_title_id.as_deref() == Some(profile_id.as_str()) {
+                                edit_resp.request_focus();
+                                self.profile_focus_title_id = None;
+                            }
+                            if edit_resp.changed() {
+                                dirty = true;
+                            }
+
+                            // Left controls cluster: Delete (`حذف` / `تأكيد؟`), Open (`تفعيل` / `نشط`), completion badge.
+                            row_ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+
+                                // 1. 2-click Delete (disabled if only 1 profile remains).
+                                if !can_delete {
+                                    let (del_rect, _) = ui.allocate_exact_size(
+                                        vec2(42.0, MIN_HITBOX_SIZE),
+                                        Sense::hover(),
+                                    );
+                                    ui.painter().text(
+                                        del_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        shape_arabic("حذف"),
+                                        FontId::proportional(12.5),
+                                        theme::HINT,
+                                    );
+                                } else if is_confirming_del {
+                                    let (c_rect, c_resp) = ui.allocate_exact_size(
+                                        vec2(52.0, MIN_HITBOX_SIZE),
+                                        Sense::click(),
+                                    );
+                                    let c_resp = c_resp.on_hover_cursor(CursorIcon::PointingHand);
+                                    let pill =
+                                        Rect::from_center_size(c_rect.center(), vec2(50.0, 22.0));
+                                    ui.painter().rect_filled(
+                                        pill,
+                                        CornerRadius::same(0),
+                                        theme::RED_BAR,
+                                    );
+                                    ui.painter().text(
+                                        pill.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        shape_arabic("تأكيد؟"),
+                                        FontId::proportional(12.5),
+                                        theme::PANE,
+                                    );
+                                    if c_resp.clicked() {
+                                        delete_idx = Some(idx);
+                                    }
+                                } else {
+                                    let del_resp = index_text_action(
+                                        ui,
+                                        "حذف",
+                                        42.0,
+                                        theme::SLATE,
+                                        theme::RED_BAR,
+                                    )
+                                    .on_hover_text("DELETE PROFILE");
+                                    if del_resp.clicked() {
+                                        self.profile_confirm_delete_id = Some(profile_id.clone());
+                                    }
+                                }
+
+                                // 2. Activate (`تفعيل` / `OPEN`) or active badge (`نشط`).
+                                if is_active {
+                                    let (act_rect, _) = ui.allocate_exact_size(
+                                        vec2(54.0, MIN_HITBOX_SIZE),
+                                        Sense::hover(),
+                                    );
+                                    let pill =
+                                        Rect::from_center_size(act_rect.center(), vec2(50.0, 22.0));
+                                    ui.painter().rect_filled(
+                                        pill,
+                                        CornerRadius::same(0),
+                                        theme::GREEN_BAR,
+                                    );
+                                    ui.painter().text(
+                                        pill.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        shape_arabic("نشط"),
+                                        FontId::proportional(12.5),
+                                        theme::PANE,
+                                    );
+                                } else {
+                                    let (open_rect, open_resp) = ui.allocate_exact_size(
+                                        vec2(54.0, MIN_HITBOX_SIZE),
+                                        Sense::click(),
+                                    );
+                                    let open_resp =
+                                        open_resp.on_hover_cursor(CursorIcon::PointingHand);
+                                    let pill = Rect::from_center_size(
+                                        open_rect.center(),
+                                        vec2(52.0, 22.0),
+                                    );
+                                    let bg = if open_resp.hovered() {
+                                        theme::INK
+                                    } else {
+                                        theme::PANE
+                                    };
+                                    let fg = if open_resp.hovered() {
+                                        theme::PANE
+                                    } else {
+                                        theme::INK
+                                    };
+                                    ui.painter().rect_filled(pill, CornerRadius::same(0), bg);
+                                    ui.painter().rect_stroke(
+                                        pill,
+                                        CornerRadius::same(0),
+                                        Stroke::new(1.2, theme::INK),
+                                        StrokeKind::Inside,
+                                    );
+                                    ui.painter().text(
+                                        pill.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        shape_arabic("تفعيل"),
+                                        FontId::proportional(12.5),
+                                        fg,
+                                    );
+                                    if open_resp.clicked() {
+                                        activate_idx = Some(idx);
+                                    }
+                                }
+
+                                // 3. Completion badge (`done/total` in `#10B981` or `#0F172A`).
+                                let badge_col = if total > 0 && done == total {
+                                    theme::GREEN_BAR
+                                } else {
+                                    theme::INK
+                                };
+                                ui.label(
+                                    mono(format!("{}/{}", done, total), 13.0)
+                                        .strong()
+                                        .color(badge_col),
+                                );
+                            });
+
+                            if idx + 1 < profile_count {
+                                let (sep, _) = ui.allocate_exact_size(
+                                    vec2(ui.available_width(), 1.0),
+                                    Sense::hover(),
+                                );
+                                ui.painter()
+                                    .rect_filled(sep, CornerRadius::same(0), theme::SUBTLE_RULE);
+                            }
+                        }
+                    });
+            });
+
+        if dirty {
+            self.mark_dirty();
+        }
+        if create_new {
+            // Keep Profiles modal open (`show_profiles_modal = true`) and auto-focus
+            // the newly created blank profile's inline title editor immediately.
+            let new_id = self.create_new_profile(Some(ctx));
+            let edit_id = Id::new(("profile_title_edit", new_id.as_str()));
+            ctx.memory_mut(|m| m.request_focus(edit_id));
+        } else if carry_over {
+            self.carry_over_active_from_previous(Some(ctx));
+            self.show_profiles_modal = false;
+        } else if let Some(idx) = activate_idx {
+            self.switch_to_profile(idx, Some(ctx));
+            self.show_profiles_modal = false;
+        } else if let Some(idx) = delete_idx {
+            self.delete_profile_at(idx, Some(ctx));
+        } else if close_modal {
+            self.show_profiles_modal = false;
+            self.profile_confirm_delete_id = None;
+            self.profile_focus_title_id = None;
+        }
+    }
+
+    /// Minimal First-Run Quick Guide (`520px` wide, `0.0px` Swiss welcome card,
+    /// `#FFFFFF` fill, `1.5px` `#0F172A` border, `4.0px` solid `#0F172A` shadow).
+    fn render_onboarding_modal(&mut self, ctx: &egui::Context) {
+        let screen = ctx.viewport_rect();
+        let card_w = (screen.width() - 40.0).clamp(320.0, 520.0);
+        let card_h = 336.0_f32.min(screen.height() - 48.0).max(260.0);
+        let card_rect = Rect::from_center_size(screen.center(), vec2(card_w, card_h));
+        let mut start_work = false;
+
+        egui::Area::new(Id::new("onboarding_quick_guide"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .default_size(screen.size())
+            .constrain(false)
+            .fade_in(false)
+            .show(ctx, |ui| {
+                let _ = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter().rect_filled(
+                    screen,
+                    CornerRadius::same(0),
+                    Color32::from_black_alpha(64),
+                );
+
+                // 4.0px solid #0F172A offset shadow + #FFFFFF card + 1.5px #0F172A border.
+                ui.painter().rect_filled(
+                    card_rect.translate(vec2(-4.0, 4.0)),
+                    CornerRadius::same(0),
+                    theme::INK,
+                );
+                ui.painter()
+                    .rect_filled(card_rect, CornerRadius::same(0), theme::PANE);
+                ui.painter().rect_stroke(
+                    card_rect,
+                    CornerRadius::same(0),
+                    Stroke::new(1.5, theme::INK),
+                    StrokeKind::Inside,
+                );
+
+                let inner = card_rect.shrink(24.0);
+                let mut m_ui = ui.new_child(
+                    UiBuilder::new()
+                        .max_rect(inner)
+                        .layout(Layout::top_down(Align::Max)),
+                );
+                m_ui.set_clip_rect(inner);
+
+                // Title: `دليل الاستخدام السريع` (`20.0px` Bold `#0F172A`).
+                m_ui.label(
+                    RichText::new(shape_arabic("دليل الاستخدام السريع"))
+                        .size(20.0)
+                        .strong()
+                        .color(theme::INK),
+                );
+                m_ui.add_space(10.0);
+
+                let (div, _) =
+                    m_ui.allocate_exact_size(vec2(m_ui.available_width(), 1.0), Sense::hover());
+                m_ui.painter()
+                    .rect_filled(div, CornerRadius::same(0), theme::SUBTLE_RULE);
+                m_ui.add_space(14.0);
+
+                let bullets = [
+                    "1. إضافة الفروع: اكتب في الشريط السفلي لأي لوحة واضغط Enter.",
+                    "2. طيّ الفروع: اضغط المربع الصغير [−] أو [+N] يسار البطاقة لإخفاء أو إظهار تفرعاتها.",
+                    "3. الملاحظات: نقرة واحدة على أي بطاقة تفتح دفتر الملاحظات الورقي الخاص بها.",
+                    "4. تنظيم الصفحات: افتح تبويب INDEX وحدد أي مهمة لتحريكها بين الصفحات بالأسهم ↑ ↓.",
+                ];
+                let bullet_font = FontId::proportional(15.5);
+                let bullet_color = Color32::from_rgb(0x1E, 0x29, 0x3B);
+                let wrap_w = m_ui.available_width().max(120.0);
+                for line in bullets {
+                    let (wrapped, size) = wrap_and_shape_rtl(&m_ui, line, bullet_font.clone(), wrap_w);
+                    let (line_rect, _) =
+                        m_ui.allocate_exact_size(vec2(wrap_w, size.y + 4.0), Sense::hover());
+                    let mut job = egui::text::LayoutJob::default();
+                    job.wrap.max_width = f32::INFINITY;
+                    job.halign = Align::RIGHT;
+                    job.append(
+                        &wrapped,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: bullet_font.clone(),
+                            color: bullet_color,
+                            ..Default::default()
+                        },
+                    );
+                    let galley = m_ui.fonts_mut(|f| f.layout_job(job));
+                    m_ui.painter().galley(
+                        pos2(line_rect.right(), line_rect.top()),
+                        galley,
+                        bullet_color,
+                    );
+                    m_ui.add_space(8.0);
+                }
+
+                m_ui.add_space(10.0);
+                // High-contrast CTA button `ابدأ العمل` (`#0F172A` fill, `#FFFFFF` 15.5px Bold).
+                let (btn_rect, btn_resp) =
+                    m_ui.allocate_exact_size(vec2(150.0, 38.0), Sense::click());
+                let btn_resp = btn_resp.on_hover_cursor(CursorIcon::PointingHand);
+                let btn_bg = if btn_resp.hovered() {
+                    theme::GRID
+                } else {
+                    theme::INK
+                };
+                m_ui.painter()
+                    .rect_filled(btn_rect, CornerRadius::same(0), btn_bg);
+                let cta_text = shape_arabic("ابدأ العمل");
+                let cta_font = FontId::proportional(15.5);
+                m_ui.painter().text(
+                    btn_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &cta_text,
+                    cta_font.clone(),
+                    theme::PANE,
+                );
+                m_ui.painter().text(
+                    btn_rect.center() + vec2(0.45, 0.0),
+                    egui::Align2::CENTER_CENTER,
+                    &cta_text,
+                    cta_font,
+                    theme::PANE,
+                );
+                if btn_resp.clicked() {
+                    start_work = true;
+                }
+            });
+
+        if start_work {
+            self.data.has_seen_onboarding = true;
+            self.show_onboarding_modal = false;
+            self.mark_dirty();
+            self.auto_save();
+        }
     }
 
     /// Full-canvas Swiss architectural Master Index view (`#FFFFFF`, `0.0px`):
@@ -2190,6 +3045,9 @@ impl WhiteboardApp {
         if let Some((node_id, status)) = actions.set_node_status {
             self.set_single_node_status(&node_id, status);
         }
+        if let Some(node_id) = actions.cycle_node_stamp {
+            self.cycle_node_stamp(&node_id);
+        }
         if let Some((pane_id, title)) = actions.append_branch {
             self.append_branch_to_pane(&pane_id, &title);
         }
@@ -2267,6 +3125,8 @@ struct PaneActions {
     delete_node: Option<String>,
     /// Update a single node's status with undo history tracking.
     set_node_status: Option<(String, TaskStatus)>,
+    /// Cycle a single node's geometric watermark stamp (`None -> Dog -> ... -> None`).
+    cycle_node_stamp: Option<String>,
     /// Append a top-level branch to a pane with undo history tracking.
     append_branch: Option<(String, String)>,
     /// Open the embedded note drawer on card click without stealing card focus.
@@ -3706,6 +4566,64 @@ fn top_bar_tab(ui: &mut Ui, text: &str, active: bool) -> egui::Response {
     response
 }
 
+/// Compact single-click chronological profile selector pill `[ YYYY-MM-DD ▾ ]`
+/// (`14.0px` SemiBold, `0.0px` sharp border, painter-drawn downward triangle).
+fn profile_selector_pill(ui: &mut Ui, date_str: &str, open: bool) -> egui::Response {
+    let font = FontId::monospace(13.5);
+    let label = format!("[ {}   ]", date_str);
+    let text_w = ui
+        .fonts_mut(|f| f.layout_no_wrap(label.clone(), font.clone(), Color32::TRANSPARENT))
+        .size()
+        .x;
+    let pill_w = (text_w + 14.0).max(122.0);
+    let (hit_rect, response) =
+        ui.allocate_exact_size(vec2(pill_w, ui.available_height().max(28.0)), Sense::click());
+    let response = response.on_hover_cursor(CursorIcon::PointingHand);
+    let box_rect = Rect::from_center_size(hit_rect.center(), vec2(pill_w, 24.0));
+    let (bg, fg) = if open {
+        (theme::INK, theme::PANE)
+    } else if response.hovered() {
+        (theme::SEL_FILL, theme::INK)
+    } else {
+        (theme::PANE, theme::INK)
+    };
+    ui.painter()
+        .rect_filled(box_rect, CornerRadius::same(0), bg);
+    ui.painter().rect_stroke(
+        box_rect,
+        CornerRadius::same(0),
+        Stroke::new(if open { 1.5 } else { 1.0 }, theme::INK),
+        StrokeKind::Inside,
+    );
+    ui.painter().text(
+        pos2(box_rect.left() + 7.0, box_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        &label,
+        font.clone(),
+        fg,
+    );
+    ui.painter().text(
+        pos2(box_rect.left() + 7.45, box_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        &label,
+        font,
+        fg,
+    );
+    // Crisp painter-drawn downward triangle inside the right bracket (never relies on Unicode ▾).
+    let tri_cx = box_rect.right() - 18.0;
+    let tri_cy = box_rect.center().y;
+    ui.painter().add(Shape::convex_polygon(
+        vec![
+            pos2(tri_cx - 3.2, tri_cy - 1.5),
+            pos2(tri_cx + 3.2, tri_cy - 1.5),
+            pos2(tri_cx, tri_cy + 2.5),
+        ],
+        fg,
+        Stroke::NONE,
+    ));
+    response
+}
+
 fn pill_button(ui: &mut Ui, text: &str, color: Color32, filled: bool) -> egui::Response {
     let (fill, fg) = if filled {
         (color, theme::PANE)
@@ -3918,8 +4836,19 @@ const SHADOW_OFFSET: Vec2 = Vec2::new(-3.0, 3.0);
 const SHADOW_PAD: f32 = 6.0;
 /// Height of the zero-overlap contextual hover strip (`0.0px` edge pill).
 const HOVER_STRIP_H: f32 = 22.0;
-/// Width of each action slot inside the 3-action hover strip (`✓`, `+`, `≡`).
+/// Width of each action slot inside the contextual hover strip (`✓`, `+`, `≡`).
 const HOVER_STRIP_SLOT_W: f32 = 24.0;
+/// Width of the compact `STAMP` cycle slot in the contextual hover strip.
+const HOVER_STRIP_STAMP_W: f32 = 42.0;
+/// Crisp single-color slate stroke (`#94A3B8`) for geometric card watermark stamps.
+fn stamp_watermark_stroke_color() -> Color32 {
+    Color32::from_rgb(0x94, 0xA3, 0xB8)
+}
+
+/// Ultra-subtle cool slate interior tint (`#CBD5E1` @ ~22% alpha) backing geometric line-art stamps.
+fn stamp_watermark_color() -> Color32 {
+    Color32::from_rgba_unmultiplied(0xCB, 0xD5, 0xE1, 56)
+}
 /// Top margin applied when top-aligning dense task trees inside a pane.
 const DENSE_TOP_MARGIN: f32 = 14.0;
 /// Extra bottom padding reserved beneath the bottom card's 3.0px shadow inside scroll areas.
@@ -4390,10 +5319,13 @@ struct HoverControl {
     check_rect: Rect,
     plus_rect: Rect,
     notes_rect: Rect,
+    stamp_rect: Rect,
     check_hovered: bool,
     plus_hovered: bool,
     notes_hovered: bool,
+    stamp_hovered: bool,
     is_completed: bool,
+    has_stamp: bool,
     is_direct_hover: bool,
 }
 
@@ -4580,7 +5512,7 @@ fn render_node_card(
     // Sticky zero-gap contextual hover strip flush against the card's top edge
     // (`strip_rect.bottom() == rect.top()`, zero gap), clamped horizontally inside
     // `pane_rect.shrink(4.0)` so short cards near the right edge never clip the strip.
-    let strip_w = HOVER_STRIP_SLOT_W * 3.0;
+    let strip_w = HOVER_STRIP_SLOT_W * 3.0 + HOVER_STRIP_STAMP_W;
     let clamped_x = rect.left().clamp(
         hover_clamp_rect.left(),
         (hover_clamp_rect.right() - strip_w).max(hover_clamp_rect.left()),
@@ -4603,6 +5535,13 @@ fn render_node_card(
             strip_rect.top(),
         ),
         vec2(HOVER_STRIP_SLOT_W, HOVER_STRIP_H),
+    );
+    let stamp_rect = Rect::from_min_size(
+        pos2(
+            strip_rect.left() + HOVER_STRIP_SLOT_W * 3.0,
+            strip_rect.top(),
+        ),
+        vec2(HOVER_STRIP_STAMP_W, HOVER_STRIP_H),
     );
 
     let mut card_hit_area = rect;
@@ -4682,6 +5621,18 @@ fn render_node_card(
             num_font,
             theme::PANE,
         );
+    }
+
+    // 2c. Visible single-color geometric line-art stamp (`24.0px × 24.0px` bounds,
+    // `4.0px` inset in the bottom-left interior corner) painted BEFORE card text so it
+    // sits cleanly behind text without interfering with readability.
+    if let Some(stamp) = node.stamp {
+        let stamp_bounds = Rect::from_min_size(
+            pos2(rect.left() + 4.0, (rect.bottom() - 4.0 - 24.0).max(rect.top() + 2.0)),
+            vec2(24.0, 24.0),
+        );
+        let stamp_painter = ui.painter_at(rect.shrink(1.5).intersect(col_clip));
+        paint_card_stamp(&stamp_painter, stamp_bounds, stamp);
     }
 
     // 3. Corner ink dog-ear indicator (8.0px × 8.0px solid #0F172A right-triangle)
@@ -4976,6 +5927,13 @@ fn render_node_card(
                 Sense::click(),
             )
             .on_hover_cursor(CursorIcon::PointingHand);
+        let stamp_response = ui
+            .interact(
+                hit_up(stamp_rect),
+                ui.id().with(("hover_stamp", &node_id)),
+                Sense::click(),
+            )
+            .on_hover_cursor(CursorIcon::PointingHand);
 
         if check_response.clicked() {
             let next_status = if node.status == TaskStatus::Completed {
@@ -4994,22 +5952,32 @@ fn render_node_card(
             *focused_node_id = Some(node_id.clone());
             actions.focus_open_drawer = Some(node_id.clone());
         }
+        if stamp_response.clicked() {
+            actions.cycle_node_stamp = Some(node_id.clone());
+        }
 
         hover_controls.push(HoverControl {
             strip_rect,
             check_rect,
             plus_rect,
             notes_rect,
+            stamp_rect,
             check_hovered: check_response.hovered(),
             plus_hovered: plus_response.hovered(),
             notes_hovered: notes_response.hovered(),
+            stamp_hovered: stamp_response.hovered(),
             is_completed: node.status == TaskStatus::Completed,
+            has_stamp: node.stamp.is_some(),
             is_direct_hover: direct_hover,
         });
 
         check_response.on_hover_text("TOGGLE ACTIVE / COMPLETED");
         plus_response.on_hover_text("ADD CHILD BRANCH");
         notes_response.on_hover_text("OPEN NOTES DRAWER");
+        stamp_response.on_hover_text(match node.stamp {
+            Some(s) => format!("STAMP: {} (CLICK TO CYCLE)", s.label_en()),
+            None => "CYCLE WATERMARK STAMP".to_string(),
+        });
     }
 
     actions.node_rects.push((node_id, rect));
@@ -5023,7 +5991,7 @@ fn render_node_card(
 /// Shared right-click context menu for a subtask card.
 fn render_card_context_menu(
     ui: &mut Ui,
-    _node: &mut TaskNode,
+    node: &mut TaskNode,
     node_id: &str,
     focused_node_id: &mut Option<String>,
     editing_node_id: &mut Option<String>,
@@ -5052,6 +6020,17 @@ fn render_card_context_menu(
         actions.set_node_status = Some((node_id.to_string(), TaskStatus::Cancelled));
     }
     ui.separator();
+    let stamp_label = match node.stamp {
+        Some(s) => format!("STAMP: {}", s.label_en()),
+        None => "STAMP: NONE".to_string(),
+    };
+    if ui
+        .button(stamp_label)
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .clicked()
+    {
+        actions.cycle_node_stamp = Some(node_id.to_string());
+    }
     if ui
         .button(shape_arabic("الملاحظات / Notes"))
         .on_hover_cursor(CursorIcon::PointingHand)
@@ -5172,10 +6151,173 @@ fn paint_fold_handles(ui: &Ui, handles: &[FoldHandleVisual]) {
     }
 }
 
+/// Paints a distinct, recognizable monochrome geometric line-art silhouette
+/// (`24.0px × 24.0px` bounds, `1.5px` `#94A3B8` stroke with subtle `#CBD5E1`
+/// interior wash) inside a card's bottom-left interior corner behind card text.
+fn paint_card_stamp(painter: &Painter, b: Rect, stamp: CardStamp) {
+    let stroke_col = stamp_watermark_stroke_color();
+    let fill_col = stamp_watermark_color();
+    let stroke = Stroke::new(1.5, stroke_col);
+    let thin = Stroke::new(1.2, stroke_col);
+    let p = |x: f32, y: f32| pos2(b.left() + x * b.width(), b.top() + y * b.height());
+
+    match stamp {
+        CardStamp::Dog => {
+            // Geometric profile dog head with floppy ear & prominent snout.
+            let head_pts = vec![
+                p(0.24, 0.20),
+                p(0.56, 0.20),
+                p(0.66, 0.38),
+                p(0.92, 0.42),
+                p(0.88, 0.62),
+                p(0.54, 0.66),
+                p(0.46, 0.88),
+                p(0.18, 0.88),
+                p(0.18, 0.44),
+            ];
+            painter.add(Shape::convex_polygon(
+                vec![p(0.24, 0.20), p(0.56, 0.20), p(0.66, 0.38), p(0.54, 0.66), p(0.18, 0.44)],
+                fill_col,
+                Stroke::NONE,
+            ));
+            painter.add(Shape::closed_line(head_pts, stroke));
+            // Floppy ear hanging along left side of head.
+            let ear_pts = vec![p(0.22, 0.24), p(0.42, 0.28), p(0.38, 0.64), p(0.18, 0.58)];
+            painter.add(Shape::convex_polygon(ear_pts.clone(), fill_col, Stroke::NONE));
+            painter.add(Shape::closed_line(ear_pts, stroke));
+            // Eye + nose tip accent.
+            painter.circle_filled(p(0.54, 0.36), 1.4, stroke_col);
+            painter.circle_filled(p(0.90, 0.44), 1.6, stroke_col);
+        }
+        CardStamp::Cat => {
+            // Geometric cat face with two sharp pointed triangular ears & whiskers.
+            let face_pts = vec![
+                p(0.20, 0.12),
+                p(0.38, 0.32),
+                p(0.62, 0.32),
+                p(0.80, 0.12),
+                p(0.82, 0.62),
+                p(0.50, 0.86),
+                p(0.18, 0.62),
+            ];
+            painter.add(Shape::convex_polygon(
+                vec![p(0.20, 0.32), p(0.80, 0.32), p(0.82, 0.62), p(0.50, 0.86), p(0.18, 0.62)],
+                fill_col,
+                Stroke::NONE,
+            ));
+            painter.add(Shape::closed_line(face_pts, stroke));
+            // Eyes & triangular nose.
+            painter.circle_filled(p(0.37, 0.50), 1.4, stroke_col);
+            painter.circle_filled(p(0.63, 0.50), 1.4, stroke_col);
+            painter.add(Shape::closed_line(
+                vec![p(0.45, 0.60), p(0.55, 0.60), p(0.50, 0.67)],
+                thin,
+            ));
+            // Four crisp geometric whiskers.
+            painter.line_segment([p(0.04, 0.54), p(0.24, 0.58)], thin);
+            painter.line_segment([p(0.04, 0.67), p(0.24, 0.65)], thin);
+            painter.line_segment([p(0.76, 0.58), p(0.96, 0.54)], thin);
+            painter.line_segment([p(0.76, 0.65), p(0.96, 0.67)], thin);
+        }
+        CardStamp::Duck => {
+            // Geometric duck silhouette with flat horizontal bill & upturned tail.
+            let body_pts = vec![
+                p(0.28, 0.20),
+                p(0.48, 0.20),
+                p(0.52, 0.48),
+                p(0.76, 0.48),
+                p(0.94, 0.34),
+                p(0.86, 0.74),
+                p(0.72, 0.84),
+                p(0.28, 0.84),
+                p(0.22, 0.62),
+                p(0.28, 0.46),
+            ];
+            painter.add(Shape::convex_polygon(
+                vec![p(0.26, 0.48), p(0.86, 0.48), p(0.72, 0.84), p(0.28, 0.84)],
+                fill_col,
+                Stroke::NONE,
+            ));
+            painter.add(Shape::closed_line(body_pts, stroke));
+            // Flat geometric bill extending left.
+            let bill_pts = vec![p(0.06, 0.34), p(0.28, 0.30), p(0.28, 0.44), p(0.08, 0.44)];
+            painter.add(Shape::convex_polygon(bill_pts.clone(), fill_col, Stroke::NONE));
+            painter.add(Shape::closed_line(bill_pts, stroke));
+            // Eye + wing fold line.
+            painter.circle_filled(p(0.38, 0.30), 1.4, stroke_col);
+            painter.line_segment([p(0.44, 0.60), p(0.72, 0.60)], thin);
+            painter.line_segment([p(0.72, 0.60), p(0.62, 0.72)], thin);
+        }
+        CardStamp::Bird => {
+            // Geometric origami bird with swept triangular wing, beak & forked tail.
+            let beak = vec![p(0.06, 0.42), p(0.26, 0.34), p(0.26, 0.48)];
+            painter.add(Shape::closed_line(beak, stroke));
+            let body = vec![
+                p(0.26, 0.34),
+                p(0.56, 0.46),
+                p(0.94, 0.38),
+                p(0.76, 0.60),
+                p(0.88, 0.74),
+                p(0.52, 0.70),
+                p(0.24, 0.54),
+            ];
+            painter.add(Shape::convex_polygon(
+                vec![p(0.26, 0.34), p(0.56, 0.46), p(0.52, 0.70), p(0.24, 0.54)],
+                fill_col,
+                Stroke::NONE,
+            ));
+            painter.add(Shape::closed_line(body, stroke));
+            // Swept origami wing + crisp crease line.
+            let wing = vec![p(0.34, 0.40), p(0.68, 0.10), p(0.60, 0.48)];
+            painter.add(Shape::convex_polygon(wing.clone(), fill_col, Stroke::NONE));
+            painter.add(Shape::closed_line(wing, stroke));
+            painter.line_segment([p(0.46, 0.44), p(0.68, 0.10)], thin);
+            // Legs.
+            painter.line_segment([p(0.42, 0.66), p(0.38, 0.88)], thin);
+            painter.line_segment([p(0.52, 0.68), p(0.54, 0.88)], thin);
+        }
+        CardStamp::Star => {
+            // Crisp 5-point geometric star outline (`1.5px` `#94A3B8`) + subtle `#CBD5E1` wash.
+            let center = b.center();
+            let r_outer = b.width() * 0.46;
+            let r_inner = b.width() * 0.20;
+            let mut star_pts = Vec::with_capacity(10);
+            let mut outer = [Pos2::ZERO; 5];
+            let mut inner = [Pos2::ZERO; 5];
+            for i in 0..5 {
+                let a_out = -std::f32::consts::FRAC_PI_2
+                    + (i as f32) * std::f32::consts::TAU / 5.0;
+                let a_in = a_out + std::f32::consts::PI / 5.0;
+                outer[i] = pos2(
+                    center.x + r_outer * a_out.cos(),
+                    center.y + r_outer * a_out.sin(),
+                );
+                inner[i] = pos2(
+                    center.x + r_inner * a_in.cos(),
+                    center.y + r_inner * a_in.sin(),
+                );
+                star_pts.push(outer[i]);
+                star_pts.push(inner[i]);
+            }
+            for i in 0..5 {
+                let prev_in = inner[(i + 4) % 5];
+                painter.add(Shape::convex_polygon(
+                    vec![center, prev_in, outer[i], inner[i]],
+                    fill_col,
+                    Stroke::NONE,
+                ));
+            }
+            painter.add(Shape::closed_line(star_pts, stroke));
+        }
+    }
+}
+
 /// Paints the zero-overlap `0.0px` contextual hover strip (`22.0px` height,
-/// `#0F172A` background, `#FFFFFF` `13.5px` Bold icons: `✓`, `+`, `≡`).
+/// `#0F172A` background, `#FFFFFF` `13.5px` Bold icons: `✓`, `+`, `≡`, `ختم`).
 fn paint_hover_controls(painter: &Painter, controls: &[HoverControl]) {
     let font = FontId::monospace(13.5);
+    let stamp_font = FontId::proportional(12.5);
+    let stamp_label = shape_arabic("ختم");
     for control in controls {
         painter.rect_filled(control.strip_rect, CornerRadius::same(0), theme::INK);
 
@@ -5184,28 +6326,28 @@ fn paint_hover_controls(painter: &Painter, controls: &[HoverControl]) {
             (control.check_rect, control.check_hovered),
             (control.plus_rect, control.plus_hovered),
             (control.notes_rect, control.notes_hovered),
+            (control.stamp_rect, control.stamp_hovered),
         ] {
             if hovered {
                 painter.rect_filled(seg_rect, CornerRadius::same(0), theme::GRID);
             }
         }
 
-        // Crisp 1px vertical separators between the 3 actions.
+        // Crisp 1px vertical separators between the 4 actions.
         let sep_stroke = Stroke::new(1.0, theme::INK_SOFT);
-        painter.line_segment(
-            [
-                pos2(control.plus_rect.left(), control.strip_rect.top() + 4.0),
-                pos2(control.plus_rect.left(), control.strip_rect.bottom() - 4.0),
-            ],
-            sep_stroke,
-        );
-        painter.line_segment(
-            [
-                pos2(control.notes_rect.left(), control.strip_rect.top() + 4.0),
-                pos2(control.notes_rect.left(), control.strip_rect.bottom() - 4.0),
-            ],
-            sep_stroke,
-        );
+        for sep_x in [
+            control.plus_rect.left(),
+            control.notes_rect.left(),
+            control.stamp_rect.left(),
+        ] {
+            painter.line_segment(
+                [
+                    pos2(sep_x, control.strip_rect.top() + 4.0),
+                    pos2(sep_x, control.strip_rect.bottom() - 4.0),
+                ],
+                sep_stroke,
+            );
+        }
 
         let check_color = if control.is_completed {
             theme::GREEN_SHADOW
@@ -5232,6 +6374,26 @@ fn paint_hover_controls(painter: &Painter, controls: &[HoverControl]) {
                 color,
             );
         }
+
+        let stamp_color = if control.has_stamp {
+            theme::GREEN_SHADOW
+        } else {
+            theme::PANE
+        };
+        painter.text(
+            control.stamp_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            &stamp_label,
+            stamp_font.clone(),
+            stamp_color,
+        );
+        painter.text(
+            control.stamp_rect.center() + vec2(0.4, 0.0),
+            egui::Align2::CENTER_CENTER,
+            &stamp_label,
+            stamp_font.clone(),
+            stamp_color,
+        );
     }
 }
 
@@ -5337,6 +6499,7 @@ mod tests {
 
     fn sample_data() -> AppData {
         let mut data = AppData::default();
+        data.has_seen_onboarding = true;
         let mut pane = MainTaskPane::new("علاج بابا");
         pane.status = TaskStatus::Active;
 
@@ -5997,6 +7160,7 @@ mod tests {
         crate::theme::install(&ctx);
 
         let mut data = AppData::default();
+        data.has_seen_onboarding = true;
         for i in 1..=5 {
             let mut p = MainTaskPane::new(&format!("Pane {}", i));
             p.subtasks.push(TaskNode::new(&format!("HiddenBranch {}", i)));
@@ -6383,6 +7547,7 @@ mod tests {
         crate::theme::install(&ctx);
 
         let mut data = AppData::default();
+        data.has_seen_onboarding = true;
         let mut pane = MainTaskPane::new("مهمة كثيفة");
         for i in 1..=16 {
             let mut n = TaskNode::new(&format!("فرع {}", i));
@@ -6676,6 +7841,7 @@ mod tests {
         crate::theme::install(&ctx);
 
         let mut data = AppData::default();
+        data.has_seen_onboarding = true;
         let mut pane = MainTaskPane::new("لوحة طويلة");
 
         // Group 0: 100% Completed children -> MUST auto-collapse on vertical overflow.
@@ -6754,6 +7920,7 @@ mod tests {
         crate::theme::install(&ctx);
 
         let mut data = AppData::default();
+        data.has_seen_onboarding = true;
         let mut pane = MainTaskPane::new("لوحة منقسمة");
         for i in 1..=9 {
             let title = if i == 6 {
@@ -6832,6 +7999,7 @@ mod tests {
         crate::theme::install(&ctx);
 
         let mut data = AppData::default();
+        data.has_seen_onboarding = true;
         let mut pane = MainTaskPane::new("لوحة عميقة");
         for i in 1..=14 {
             pane.subtasks.push(TaskNode::new(&format!("مهمة رقم {:02}", i)));
@@ -7019,6 +8187,7 @@ mod tests {
         crate::theme::install(&ctx);
 
         let mut data = AppData::default();
+        data.has_seen_onboarding = true;
         for i in 1..=5 {
             data.current_day.panes.push(MainTaskPane::new(&format!("مهمة {}", i)));
         }
@@ -7146,6 +8315,7 @@ mod tests {
         crate::theme::install(&ctx);
 
         let mut data = AppData::default();
+        data.has_seen_onboarding = true;
         for i in 1..=5 {
             data.current_day
                 .panes
@@ -7313,6 +8483,449 @@ mod tests {
         assert_eq!(
             rtl_multiline_visual_cursor_index("مرحبا\nعالم", &two_lines_shaped, 10),
             6
+        );
+    }
+
+    #[test]
+    fn daily_profiles_migrate_legacy_sort_newest_first_auto_create_and_carry_over_active_only() {
+        // 1. Legacy JSON save file (no `profiles` field, only `current_day.panes`) migrates cleanly.
+        let mut legacy = AppData::default();
+        legacy
+            .current_day
+            .panes
+            .push(MainTaskPane::new("مهمة قديمة محفوظة"));
+        let json = serde_json::to_string(&legacy).expect("serialize legacy");
+        let mut loaded: AppData = serde_json::from_str(&json).expect("deserialize legacy");
+        assert!(loaded.profiles.is_empty());
+
+        loaded.ensure_profiles_for_date("2026-11-21", 1_795_200_000, "السبت — مهام اليوم".into());
+        assert_eq!(loaded.profiles.len(), 1);
+        assert_eq!(loaded.profiles[0].date_str, "2026-11-21");
+        assert_eq!(loaded.profiles[0].panes.len(), 1);
+        assert_eq!(loaded.profiles[0].panes[0].title, "مهمة قديمة محفوظة");
+
+        // Add mixed Active / Completed / Cancelled tasks to yesterday's profile.
+        let mut p_mixed = MainTaskPane::new("لوحة مختلطة");
+        let mut active_task = TaskNode::new("مهمة نشطة");
+        active_task.status = TaskStatus::Active;
+        let mut done_task = TaskNode::new("مهمة منجزة");
+        done_task.status = TaskStatus::Completed;
+        let mut cancel_task = TaskNode::new("مهمة ملغاة");
+        cancel_task.status = TaskStatus::Cancelled;
+        p_mixed.subtasks = vec![active_task, done_task, cancel_task];
+
+        let mut p_all_done = MainTaskPane::new("لوحة منتهية");
+        let mut d = TaskNode::new("منتهي");
+        d.status = TaskStatus::Completed;
+        p_all_done.subtasks.push(d);
+
+        loaded.profiles[0].panes = vec![p_mixed, p_all_done];
+
+        // 2. Startup on the next day ("2026-11-22") prepends a fresh empty today profile at index 0
+        //    without duplicating yesterday's tasks automatically.
+        loaded.ensure_profiles_for_date("2026-11-22", 1_795_286_400, "الأحد — مهام اليوم".into());
+        assert_eq!(loaded.profiles.len(), 2);
+        assert_eq!(loaded.profiles[0].date_str, "2026-11-22");
+        assert_eq!(loaded.profiles[1].date_str, "2026-11-21");
+        assert_eq!(loaded.active_profile_idx, 0);
+        assert!(
+            loaded.current_day.panes.is_empty(),
+            "new day profile must start clean without unconsented task duplication"
+        );
+
+        // 3. One-click carry-over copies ONLY active tasks/panes and pushes an Undo snapshot.
+        loaded.has_seen_onboarding = true;
+        let mut app = WhiteboardApp::from_data(loaded);
+        app.show_quick_entry_modal = false;
+        let carried = app.carry_over_active_from_previous(None);
+        assert_eq!(carried, 1, "only the pane with active tasks should be carried over");
+        assert_eq!(app.data.current_day.panes.len(), 1);
+        assert_eq!(app.data.current_day.panes[0].title, "لوحة مختلطة");
+        assert_eq!(app.data.current_day.panes[0].subtasks.len(), 1);
+        assert_eq!(app.data.current_day.panes[0].subtasks[0].title, "مهمة نشطة");
+        assert_eq!(app.undo_stack.len(), 1);
+
+        // Undo reverts the carry-over cleanly.
+        assert!(app.undo(None));
+        assert!(app.data.current_day.panes.is_empty());
+
+        // Delete guard: deleting older profile leaves 1 profile, and deleting the last profile is blocked.
+        let prev_count = app.data.profiles.len();
+        assert!(prev_count >= 2);
+        while app.data.profiles.len() > 1 {
+            let last = app.data.profiles.len() - 1;
+            app.delete_profile_at(last, None);
+        }
+        assert_eq!(app.data.profiles.len(), 1);
+        app.delete_profile_at(0, None);
+        assert_eq!(
+            app.data.profiles.len(),
+            1,
+            "must never delete the last remaining profile"
+        );
+    }
+
+    #[test]
+    fn first_run_quick_guide_displays_dismisses_and_reopens_from_status_bar() {
+        let ctx = egui::Context::default();
+        crate::rtl_text::install_arabic_fonts(&ctx);
+        crate::theme::install(&ctx);
+
+        // Fresh state has `has_seen_onboarding == false` -> Quick Guide opens automatically.
+        let mut fresh = AppData::default();
+        fresh.current_day.panes.push(MainTaskPane::new("لوحة أولى"));
+        assert!(!fresh.has_seen_onboarding);
+
+        let mut app = WhiteboardApp::from_data(fresh);
+        assert!(app.show_onboarding_modal);
+
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 640.0)));
+        let _ = ctx.run(raw.clone(), |ctx| app.draw(ctx));
+        let out_guide = ctx.run(raw.clone(), |ctx| app.draw(ctx));
+        let guide_text = rendered_text(&out_guide);
+        assert!(
+            guide_text.contains(&shape_arabic("دليل الاستخدام السريع")),
+            "expected Quick Guide title on first run"
+        );
+        assert!(
+            guide_text.contains(&shape_arabic("ابدأ العمل")),
+            "expected high-contrast CTA button on Quick Guide"
+        );
+
+        // Locate and click `ابدأ العمل` button -> sets `has_seen_onboarding = true` and hides guide.
+        let cta_pos = out_guide
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == shape_arabic("ابدأ العمل") => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("CTA button text must be painted");
+
+        let click_at = |pos: Pos2, app: &mut WhiteboardApp| {
+            let mut down = raw.clone();
+            down.events.push(egui::Event::PointerMoved(pos));
+            down.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let _ = ctx.run(down, |ctx| app.draw(ctx));
+
+            let mut up = raw.clone();
+            up.events.push(egui::Event::PointerMoved(pos));
+            up.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            ctx.run(up, |ctx| app.draw(ctx))
+        };
+
+        let _ = click_at(cta_pos, &mut app);
+        assert!(app.data.has_seen_onboarding);
+        assert!(!app.show_onboarding_modal);
+        let out_after = ctx.run(raw.clone(), |ctx| app.draw(ctx));
+        assert!(!rendered_text(&out_after).contains(&shape_arabic("دليل الاستخدام السريع")));
+
+        // Locate and click subtle `?` button in bottom status bar -> reopens Quick Guide.
+        let help_pos = out_after
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == "?" => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("? help button must be present in bottom status bar");
+        let _ = click_at(help_pos, &mut app);
+        assert!(app.show_onboarding_modal, "clicking ? must reopen the Quick Guide");
+    }
+
+    #[test]
+    fn monochrome_geometric_watermark_stamps_cycle_and_render_in_bottom_left_corner() {
+        // Verify full stamp cycle None -> Dog -> Cat -> Duck -> Bird -> Star -> None.
+        let mut s = None;
+        for expected in [
+            Some(CardStamp::Dog),
+            Some(CardStamp::Cat),
+            Some(CardStamp::Duck),
+            Some(CardStamp::Bird),
+            Some(CardStamp::Star),
+            None,
+        ] {
+            s = CardStamp::next_option(s);
+            assert_eq!(s, expected);
+        }
+
+        let ctx = egui::Context::default();
+        crate::rtl_text::install_arabic_fonts(&ctx);
+        crate::theme::install(&ctx);
+
+        let mut app = WhiteboardApp::from_data(sample_data());
+        app.show_quick_entry_modal = false;
+        app.data.current_day.panes.truncate(1);
+        let node_id = app.data.current_day.panes[0].subtasks[0].id.clone();
+
+        // Cycle stamp onto root card (None -> Dog) and verify monochrome slate watermark renders.
+        app.cycle_node_stamp(&node_id);
+        assert_eq!(
+            app.data.current_day.panes[0].subtasks[0].stamp,
+            Some(CardStamp::Dog)
+        );
+
+        let out = ctx.run(Default::default(), |ctx| app.draw(ctx));
+        let expected_stroke = egui::epaint::ColorMode::Solid(stamp_watermark_stroke_color());
+        let has_watermark_line = out.shapes.iter().any(|c| match &c.shape {
+            egui::Shape::Path(p) => {
+                p.stroke.color == expected_stroke && (p.stroke.width - 1.5).abs() < 0.05
+            }
+            _ => false,
+        });
+        assert!(
+            has_watermark_line,
+            "expected crisp 1.5px #94A3B8 geometric line-art watermark silhouette for stamped card"
+        );
+
+        // Verify all 5 geometric stamps render cleanly without panicking.
+        for stamp in [
+            CardStamp::Dog,
+            CardStamp::Cat,
+            CardStamp::Duck,
+            CardStamp::Bird,
+            CardStamp::Star,
+        ] {
+            app.data.current_day.panes[0].subtasks[0].stamp = Some(stamp);
+            let out_s = ctx.run(Default::default(), |ctx| app.draw(ctx));
+            assert!(
+                out_s.shapes.iter().any(|c| match &c.shape {
+                    egui::Shape::Path(p) => p.stroke.color == expected_stroke,
+                    _ => false,
+                }),
+                "stamp {stamp:?} must paint visible #94A3B8 geometric line-art"
+            );
+        }
+
+        // Also test Profiles modal opens cleanly from top-bar date pill.
+        let date_label = format!("[ {}   ]", app.active_profile_date());
+        assert!(
+            rendered_text(&out).contains(&date_label),
+            "expected top-bar profile date selector pill {date_label:?}"
+        );
+        app.show_profiles_modal = true;
+        let _ = ctx.run(Default::default(), |ctx| app.draw(ctx));
+        let out_profiles = ctx.run(Default::default(), |ctx| app.draw(ctx));
+        let prof_text = rendered_text(&out_profiles);
+        assert!(prof_text.contains("PROFILES"));
+        assert!(prof_text.contains(&shape_arabic("+ بروفايل جديد")));
+        assert!(prof_text.contains(&shape_arabic("ترحيل النشط من الأمس")));
+    }
+
+    #[test]
+    fn top_bar_page_label_click_and_ctrl_arrows_flip_pages_with_zero_drag_conflict() {
+        let ctx = egui::Context::default();
+        crate::rtl_text::install_arabic_fonts(&ctx);
+        crate::theme::install(&ctx);
+
+        let mut data = AppData::default();
+        data.has_seen_onboarding = true;
+        for i in 1..=5 {
+            data.current_day
+                .panes
+                .push(MainTaskPane::new(&format!("لوحة {}", i)));
+        }
+        let mut app = WhiteboardApp::from_data(data);
+        app.show_quick_entry_modal = false;
+
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, vec2(1100.0, 640.0)));
+        let _ = ctx.run(raw.clone(), |ctx| app.draw(ctx));
+        let out = ctx.run(raw.clone(), |ctx| app.draw(ctx));
+        assert_eq!(app.current_page, 0);
+
+        // 1. Clicking directly on `PAGE 1 / 2` advances to Page 2 on the very first click
+        //    (even with a 2px pointer jitter between press and release — no StartDrag conflict!).
+        let page_pos = out
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == "PAGE 1 / 2" => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("PAGE 1 / 2 label must be rendered");
+
+        let mut press = raw.clone();
+        press.events.push(egui::Event::PointerMoved(page_pos));
+        press.events.push(egui::Event::PointerButton {
+            pos: page_pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(press, |ctx| app.draw(ctx));
+
+        let jittered = page_pos + vec2(2.0, 1.0);
+        let mut release = raw.clone();
+        release.events.push(egui::Event::PointerMoved(jittered));
+        release.events.push(egui::Event::PointerButton {
+            pos: jittered,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let out_after_click = ctx.run(release, |ctx| app.draw(ctx));
+        assert_eq!(
+            app.current_page, 1,
+            "clicking PAGE 1 / 2 with slight pointer jitter must flip to page 2 immediately"
+        );
+        assert!(
+            !out_after_click
+                .viewport_output
+                .values()
+                .flat_map(|v| &v.commands)
+                .any(|c| matches!(c, egui::ViewportCommand::StartDrag)),
+            "clicking PAGE 1 / 2 must NEVER trigger ViewportCommand::StartDrag"
+        );
+
+        // 2. Ctrl+Left flips back to Page 1, Ctrl+Right flips forward to Page 2.
+        let mut ctrl_left = raw.clone();
+        ctrl_left.modifiers = egui::Modifiers::CTRL;
+        ctrl_left.events.push(egui::Event::Key {
+            key: Key::ArrowLeft,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        });
+        let _ = ctx.run(ctrl_left, |ctx| app.draw(ctx));
+        assert_eq!(app.current_page, 0, "Ctrl+Left must flip back to page 1");
+
+        let mut ctrl_right = raw.clone();
+        ctrl_right.modifiers = egui::Modifiers::CTRL;
+        ctrl_right.events.push(egui::Event::Key {
+            key: Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        });
+        let _ = ctx.run(ctrl_right, |ctx| app.draw(ctx));
+        assert_eq!(app.current_page, 1, "Ctrl+Right must flip forward to page 2");
+    }
+
+    #[test]
+    fn creating_new_profile_starts_blank_keeps_modal_open_and_focuses_title() {
+        let ctx = egui::Context::default();
+        crate::rtl_text::install_arabic_fonts(&ctx);
+        crate::theme::install(&ctx);
+
+        let mut app = WhiteboardApp::from_data(sample_data());
+        app.show_quick_entry_modal = false;
+        app.show_profiles_modal = true;
+        assert_eq!(app.data.current_day.panes.len(), 2);
+
+        let mut raw = egui::RawInput::default();
+        raw.focused = true;
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 640.0)));
+        let _ = ctx.run(raw.clone(), |ctx| app.draw(ctx));
+        let out_modal = ctx.run(raw.clone(), |ctx| app.draw(ctx));
+
+        // 1. Click `+ بروفايل جديد` inside the modal.
+        let new_btn_pos = out_modal
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == shape_arabic("+ بروفايل جديد") => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("+ بروفايل جديد button must be rendered inside Profiles modal");
+
+        let click_at = |pos: Pos2, app: &mut WhiteboardApp| {
+            let mut down = raw.clone();
+            down.events.push(egui::Event::PointerMoved(pos));
+            down.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let _ = ctx.run(down, |ctx| app.draw(ctx));
+
+            let mut up = raw.clone();
+            up.events.push(egui::Event::PointerMoved(pos));
+            up.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            ctx.run(up, |ctx| app.draw(ctx))
+        };
+
+        let _ = click_at(new_btn_pos, &mut app);
+        let _ = ctx.run(raw.clone(), |ctx| app.draw(ctx));
+
+        // Modal MUST stay open so user can immediately name the new profile.
+        assert!(
+            app.show_profiles_modal,
+            "clicking + بروفايل جديد must keep the Profiles modal open"
+        );
+        // New profile at index 0 MUST start completely blank (never cloning old profile tasks).
+        assert_eq!(app.data.profiles.len(), 2);
+        assert_eq!(app.data.active_profile_idx, 0);
+        assert!(
+            app.data.current_day.panes.is_empty(),
+            "new profile must start completely blank"
+        );
+        assert!(
+            app.data.profiles[0].panes.is_empty(),
+            "new profile's stored panes must start completely blank"
+        );
+        assert_eq!(
+            app.data.profiles[1].panes.len(),
+            2,
+            "previous profile must preserve its original 2 panes untouched"
+        );
+
+        // New profile's inline title TextEdit MUST automatically receive focus.
+        let new_id = app.data.profiles[0].id.clone();
+        let edit_id = Id::new(("profile_title_edit", new_id.as_str()));
+        assert!(
+            ctx.memory(|m| m.has_focus(edit_id)),
+            "newly created profile's inline title TextEdit must automatically grab keyboard focus"
+        );
+
+        // 2. Clicking inside the modal card must NOT dismiss it.
+        let _ = click_at(pos2(500.0, 320.0), &mut app);
+        assert!(
+            app.show_profiles_modal,
+            "clicking inside modal_rect must NOT dismiss the Profiles modal"
+        );
+
+        // 3. Clicking strictly outside `modal_rect` closes the modal cleanly.
+        let _ = click_at(pos2(10.0, 10.0), &mut app);
+        assert!(
+            !app.show_profiles_modal,
+            "clicking outside modal_rect must dismiss the Profiles modal"
+        );
+
+        // 4. Deleting the active blank profile must NOT overwrite the surviving profile's tasks!
+        app.delete_profile_at(0, Some(&ctx));
+        assert_eq!(app.data.profiles.len(), 1);
+        assert_eq!(
+            app.data.current_day.panes.len(),
+            2,
+            "deleting the active profile must restore the surviving profile's original panes intact"
         );
     }
 }
