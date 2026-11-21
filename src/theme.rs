@@ -4,195 +4,141 @@ use egui::{
     Visuals,
 };
 
-// Modern obsidian palette.
-pub const CANVAS: Color32 = Color32::from_rgb(0x0F, 0x11, 0x17);
-pub const CARD: Color32 = Color32::from_rgb(0x18, 0x1B, 0x24);
-pub const CARD_ALT: Color32 = Color32::from_rgb(0x1E, 0x22, 0x2D);
-pub const BORDER: Color32 = Color32::from_rgb(0x2A, 0x2F, 0x3D);
-pub const BORDER_SOFT: Color32 = Color32::from_rgb(0x22, 0x26, 0x31);
-pub const INPUT_BG: Color32 = Color32::from_rgb(0x12, 0x15, 0x1D);
+// Swiss architectural whiteboard palette (OLED friendly, warm paper).
+/// Warm architectural off-white paper canvas.
+pub const CANVAS: Color32 = Color32::from_rgb(0xFA, 0xF9, 0xF6);
+/// Pure crisp white task cards.
+pub const PANE: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
+/// Deep charcoal grid dividers.
+pub const GRID: Color32 = Color32::from_rgb(0x1E, 0x29, 0x3B);
+/// Primary ink (titles, strong borders).
+pub const INK: Color32 = Color32::from_rgb(0x0F, 0x17, 0x2A);
+/// Secondary ink for nested branches.
+pub const INK_SOFT: Color32 = Color32::from_rgb(0x33, 0x41, 0x55);
+/// Muted slate (secondary text, ink threads).
+pub const SLATE: Color32 = Color32::from_rgb(0x64, 0x74, 0x8B);
+/// Quiet gray (tertiary text, inline prompts).
+pub const MUTED: Color32 = Color32::from_rgb(0x94, 0xA3, 0xB8);
+/// Hairline divider color (#94A3B8 architectural rule).
+pub const DIVIDER: Color32 = Color32::from_rgb(0x94, 0xA3, 0xB8);
+pub const INPUT_BG: Color32 = PANE;
 
-pub const TEXT: Color32 = Color32::from_rgb(0xE6, 0xE8, 0xEE);
-pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x94, 0x9B, 0xAA);
-pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x5C, 0x63, 0x74);
+pub const TEXT: Color32 = INK;
+pub const TEXT_MUTED: Color32 = SLATE;
 
-pub const AMBER: Color32 = Color32::from_rgb(0xF5, 0x9E, 0x0B);
-pub const EMERALD: Color32 = Color32::from_rgb(0x10, 0xB9, 0x81);
-pub const CORAL: Color32 = Color32::from_rgb(0xEF, 0x44, 0x44);
-pub const SLATE: Color32 = Color32::from_rgb(0x94, 0xA3, 0xB8);
+// Tri-state architectural shadow palette (solid hard offset shadows).
+pub const AMBER_INK: Color32 = Color32::from_rgb(0xD9, 0x77, 0x06);
+pub const GREEN_BAR: Color32 = Color32::from_rgb(0x16, 0xA3, 0x4A);
+pub const RED_BAR: Color32 = Color32::from_rgb(0xDC, 0x26, 0x26);
 
-pub const CARD_RADIUS: u8 = 10;
-pub const PADDING: i8 = 14;
+/// Hard architectural shadow colors.
+pub const AMBER_SHADOW: Color32 = Color32::from_rgb(0xF5, 0x9E, 0x0B);
+pub const GREEN_SHADOW: Color32 = Color32::from_rgb(0x10, 0xB9, 0x81);
+pub const RED_SHADOW: Color32 = Color32::from_rgb(0xEF, 0x44, 0x44);
 
-pub fn blend(base: Color32, overlay: Color32, t: f32) -> Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let mix = |a: u8, b: u8| (a as f32 * (1.0 - t) + b as f32 * t).round() as u8;
-    Color32::from_rgb(
-        mix(base.r(), overlay.r()),
-        mix(base.g(), overlay.g()),
-        mix(base.b(), overlay.b()),
-    )
-}
+/// Neutral fill for selected rows / widgets.
+pub const SEL_FILL: Color32 = Color32::from_rgb(0xF1, 0xF5, 0xF9);
 
-pub fn status_color(status: TaskStatus) -> Color32 {
+/// Subtle architectural paper fill for embedded note drawers & folded pane rails (#F8FAFC).
+pub const DRAWER_BG: Color32 = Color32::from_rgb(0xF8, 0xFA, 0xFC);
+
+/// Faint placeholder/hint color for empty inputs.
+pub const HINT: Color32 = Color32::from_rgb(0xCB, 0xD5, 0xE1);
+
+pub const CARD_RADIUS: u8 = 0;
+/// Thickness of the black tiling grid lines.
+pub const GRID_LINE: f32 = 2.0;
+/// Thickness of the hairline chrome borders (top bar, bottom bar, cards).
+pub const HAIRLINE: f32 = 1.0;
+pub const PADDING: i8 = 16;
+
+/// Solid hard-shadow color for the given task status.
+pub fn status_shadow_color(status: TaskStatus) -> Color32 {
     match status {
-        TaskStatus::Default => SLATE,
-        TaskStatus::Yellow => AMBER,
-        TaskStatus::Green => EMERALD,
-        TaskStatus::Red => CORAL,
-    }
-}
-
-/// Accent used for text of the given status.
-pub fn status_text_color(status: TaskStatus) -> Color32 {
-    match status {
-        TaskStatus::Default => TEXT,
-        _ => status_color(status),
-    }
-}
-
-/// Vivid but subtle tinted card surface.
-pub fn card_fill(status: TaskStatus) -> Color32 {
-    match status {
-        TaskStatus::Default => CARD,
-        TaskStatus::Yellow => blend(CARD, AMBER, 0.07),
-        TaskStatus::Green => blend(CARD, EMERALD, 0.06),
-        TaskStatus::Red => blend(CARD, CORAL, 0.07),
-    }
-}
-
-pub fn card_border(status: TaskStatus, selected: bool) -> Color32 {
-    if selected {
-        AMBER
-    } else {
-        match status {
-            TaskStatus::Default => BORDER,
-            _ => blend(BORDER, status_color(status), 0.55),
-        }
-    }
-}
-
-/// Tinted background for a tree row.
-pub fn row_fill(status: TaskStatus, selected: bool) -> Color32 {
-    if selected {
-        return blend(CARD_ALT, AMBER, 0.16);
-    }
-    match status {
-        TaskStatus::Default => Color32::from_rgb(0x15, 0x18, 0x21),
-        TaskStatus::Yellow => blend(CARD, AMBER, 0.12),
-        TaskStatus::Green => blend(CARD, EMERALD, 0.11),
-        TaskStatus::Red => blend(CARD, CORAL, 0.12),
-    }
-}
-
-pub fn row_border(status: TaskStatus, selected: bool) -> Color32 {
-    if selected {
-        AMBER
-    } else {
-        let strength = if status == TaskStatus::Default {
-            0.20
-        } else {
-            0.45
-        };
-        blend(row_fill(status, false), status_color(status), strength)
-    }
-}
-
-pub fn chip_fill(status: TaskStatus) -> Color32 {
-    match status {
-        TaskStatus::Default => Color32::from_rgb(0x22, 0x26, 0x31),
-        _ => blend(CARD, status_color(status), 0.22),
+        TaskStatus::Active => AMBER_SHADOW,
+        TaskStatus::Completed => GREEN_SHADOW,
+        TaskStatus::Cancelled => RED_SHADOW,
     }
 }
 
 pub fn install(ctx: &egui::Context) {
-    let mut visuals = Visuals::dark();
+    let mut visuals = Visuals::light();
 
-    visuals.override_text_color = Some(TEXT);
+    // Placeholder hints (empty inputs) use a very faint gray.
+    visuals.weak_text_color = Some(HINT);
     visuals.panel_fill = CANVAS;
-    visuals.window_fill = CARD;
-    visuals.window_stroke = Stroke::new(1.0, BORDER);
-    visuals.window_corner_radius = CornerRadius::same(14);
-    visuals.window_shadow = Shadow {
-        offset: [0, 10],
-        blur: 28,
-        spread: 0,
-        color: Color32::from_black_alpha(160),
-    };
-    visuals.popup_shadow = visuals.window_shadow;
+    visuals.window_fill = PANE;
+    visuals.window_stroke = Stroke::new(HAIRLINE, GRID);
+    visuals.window_corner_radius = CornerRadius::same(CARD_RADIUS);
+    visuals.window_shadow = Shadow::NONE;
+    visuals.popup_shadow = Shadow::NONE;
     visuals.menu_corner_radius = CornerRadius::same(CARD_RADIUS);
-    visuals.faint_bg_color = Color32::from_rgb(0x13, 0x16, 0x1E);
-    visuals.extreme_bg_color = INPUT_BG;
+    visuals.faint_bg_color = Color32::from_rgb(0xF4, 0xF4, 0xF2);
+    visuals.extreme_bg_color = PANE;
     visuals.text_edit_bg_color = Some(INPUT_BG);
-    visuals.code_bg_color = INPUT_BG;
-    visuals.warn_fg_color = AMBER;
-    visuals.error_fg_color = CORAL;
-    visuals.hyperlink_color = AMBER;
+    visuals.code_bg_color = Color32::from_rgb(0xF4, 0xF4, 0xF2);
+    visuals.warn_fg_color = AMBER_INK;
+    visuals.error_fg_color = RED_BAR;
+    visuals.hyperlink_color = GRID;
     visuals.button_frame = true;
     visuals.collapsing_header_frame = false;
     visuals.striped = false;
 
-    visuals.selection.bg_fill = blend(CARD, AMBER, 0.30);
-    visuals.selection.stroke = Stroke::new(1.0, AMBER);
+    visuals.selection.bg_fill = SEL_FILL;
+    visuals.selection.stroke = Stroke::new(1.0, GRID);
 
-    let widget_radius = CornerRadius::same(8);
+    let radius = CornerRadius::same(CARD_RADIUS);
 
-    visuals.widgets.noninteractive.bg_fill = CARD;
-    visuals.widgets.noninteractive.weak_bg_fill = CARD;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+    visuals.widgets.noninteractive.bg_fill = PANE;
+    visuals.widgets.noninteractive.weak_bg_fill = PANE;
+    visuals.widgets.noninteractive.bg_stroke =
+        Stroke::new(1.0, Color32::from_rgb(0xE3, 0xE3, 0xDF));
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
-    visuals.widgets.noninteractive.corner_radius = widget_radius;
+    visuals.widgets.noninteractive.corner_radius = radius;
     visuals.widgets.noninteractive.expansion = 0.0;
 
-    visuals.widgets.inactive.bg_fill = CARD_ALT;
-    visuals.widgets.inactive.weak_bg_fill = CARD_ALT;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER_SOFT);
+    visuals.widgets.inactive.bg_fill = PANE;
+    visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(0xF1, 0xF1, 0xEE);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xD6, 0xD6, 0xD1));
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
-    visuals.widgets.inactive.corner_radius = widget_radius;
+    visuals.widgets.inactive.corner_radius = radius;
 
-    visuals.widgets.hovered.bg_fill = blend(CARD_ALT, AMBER, 0.12);
-    visuals.widgets.hovered.weak_bg_fill = blend(CARD_ALT, AMBER, 0.12);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, blend(BORDER, AMBER, 0.45));
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.5, AMBER);
-    visuals.widgets.hovered.corner_radius = widget_radius;
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0xF1, 0xF1, 0xEE);
+    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(0xF1, 0xF1, 0xEE);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, GRID);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.5, GRID);
+    visuals.widgets.hovered.corner_radius = radius;
 
-    visuals.widgets.active.bg_fill = blend(CARD_ALT, AMBER, 0.20);
-    visuals.widgets.active.weak_bg_fill = blend(CARD_ALT, AMBER, 0.20);
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, AMBER);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.5, AMBER);
-    visuals.widgets.active.corner_radius = widget_radius;
+    visuals.widgets.active.bg_fill = Color32::from_rgb(0xE7, 0xE7, 0xE3);
+    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(0xE7, 0xE7, 0xE3);
+    visuals.widgets.active.bg_stroke = Stroke::new(GRID_LINE, GRID);
+    visuals.widgets.active.fg_stroke = Stroke::new(2.0, GRID);
+    visuals.widgets.active.corner_radius = radius;
 
-    visuals.widgets.open.bg_fill = CARD_ALT;
-    visuals.widgets.open.weak_bg_fill = CARD_ALT;
-    visuals.widgets.open.bg_stroke = Stroke::new(1.0, AMBER);
+    visuals.widgets.open.bg_fill = Color32::from_rgb(0xF1, 0xF1, 0xEE);
+    visuals.widgets.open.weak_bg_fill = Color32::from_rgb(0xF1, 0xF1, 0xEE);
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0, GRID);
     visuals.widgets.open.fg_stroke = Stroke::new(1.0, TEXT);
-    visuals.widgets.open.corner_radius = widget_radius;
+    visuals.widgets.open.corner_radius = radius;
 
     ctx.all_styles_mut(move |style: &mut Style| {
         style.visuals = visuals.clone();
+        // Prevent non-editable labels from triggering the I-beam text cursor on hover.
+        style.interaction.selectable_labels = false;
         style.spacing.item_spacing = Vec2::new(8.0, 6.0);
         style.spacing.button_padding = Vec2::new(10.0, 6.0);
         style.spacing.window_margin = Margin::same(PADDING);
         style.spacing.menu_margin = Margin::same(10);
         style.spacing.indent = 18.0;
         style.text_styles = [
-            (
-                TextStyle::Heading,
-                FontId::new(22.0, FontFamily::Proportional),
-            ),
+            (TextStyle::Heading, FontId::new(18.0, FontFamily::Monospace)),
             (
                 TextStyle::Name("PaneTitle".into()),
-                FontId::new(18.0, FontFamily::Proportional),
+                FontId::new(20.0, FontFamily::Proportional),
             ),
-            (TextStyle::Body, FontId::new(15.0, FontFamily::Proportional)),
-            (
-                TextStyle::Button,
-                FontId::new(14.0, FontFamily::Proportional),
-            ),
-            (
-                TextStyle::Small,
-                FontId::new(12.0, FontFamily::Proportional),
-            ),
+            (TextStyle::Body, FontId::new(15.5, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(14.0, FontFamily::Monospace)),
+            (TextStyle::Small, FontId::new(12.5, FontFamily::Monospace)),
             (
                 TextStyle::Monospace,
                 FontId::new(14.0, FontFamily::Monospace),

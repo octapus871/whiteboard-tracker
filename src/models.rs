@@ -1,42 +1,37 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// The three-state task system: active → completed → cancelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TaskStatus {
+    /// In progress (amber hard shadow).
     #[default]
-    Default,
-    Yellow,
-    Green,
-    Red,
+    #[serde(alias = "Yellow", alias = "Default")]
+    Active,
+    /// Done (emerald hard shadow).
+    #[serde(alias = "Green")]
+    Completed,
+    /// Cancelled (red hard shadow, strikethrough).
+    #[serde(alias = "Red")]
+    Cancelled,
 }
 
 impl TaskStatus {
-    pub fn label_ar(&self) -> &'static str {
-        match self {
-            TaskStatus::Default => "مخطط",
-            TaskStatus::Yellow => "قيد التنفيذ",
-            TaskStatus::Green => "مكتمل",
-            TaskStatus::Red => "ملغى",
-        }
-    }
-
     pub fn label_en(&self) -> &'static str {
         match self {
-            TaskStatus::Default => "Planned",
-            TaskStatus::Yellow => "In Progress",
-            TaskStatus::Green => "Completed",
-            TaskStatus::Red => "Cancelled",
+            TaskStatus::Active => "Active",
+            TaskStatus::Completed => "Completed",
+            TaskStatus::Cancelled => "Cancelled",
         }
     }
 
-    /// Cycles through the tri-color states: planned → in progress → completed
-    /// → cancelled → planned.
+    /// Cycles through the three states:
+    /// active → completed → cancelled → active.
     pub fn next(self) -> Self {
         match self {
-            TaskStatus::Default => TaskStatus::Yellow,
-            TaskStatus::Yellow => TaskStatus::Green,
-            TaskStatus::Green => TaskStatus::Red,
-            TaskStatus::Red => TaskStatus::Default,
+            TaskStatus::Active => TaskStatus::Completed,
+            TaskStatus::Completed => TaskStatus::Cancelled,
+            TaskStatus::Cancelled => TaskStatus::Active,
         }
     }
 }
@@ -49,6 +44,12 @@ pub struct TaskNode {
     pub id: String,
     pub title: String,
     pub status: TaskStatus,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub attachments: Vec<String>,
+    #[serde(default)]
+    pub collapsed: bool,
     #[serde(default)]
     pub children: Vec<TaskNode>,
     #[serde(default = "default_expanded")]
@@ -64,19 +65,34 @@ impl TaskNode {
         Self {
             id: Uuid::new_v4().to_string(),
             title: title.to_string(),
-            status: TaskStatus::Default,
+            status: TaskStatus::Active,
+            notes: String::new(),
+            attachments: Vec::new(),
+            collapsed: false,
             children: Vec::new(),
             is_expanded: true,
         }
     }
 
+    /// True when this node's child branches are visually folded.
+    pub fn is_folded(&self) -> bool {
+        self.collapsed || !self.is_expanded
+    }
+
+    /// Total number of descendant nodes hidden beneath this node.
+    pub fn descendant_count(&self) -> usize {
+        self.children
+            .iter()
+            .map(|child| 1 + child.descendant_count())
+            .sum()
+    }
+
     pub fn count_statuses(&self, counts: &mut StatusCounts) {
         counts.total += 1;
         match self.status {
-            TaskStatus::Default => counts.default_count += 1,
-            TaskStatus::Yellow => counts.yellow_count += 1,
-            TaskStatus::Green => counts.green_count += 1,
-            TaskStatus::Red => counts.red_count += 1,
+            TaskStatus::Active => counts.active_count += 1,
+            TaskStatus::Completed => counts.completed_count += 1,
+            TaskStatus::Cancelled => counts.cancelled_count += 1,
         }
         for child in &self.children {
             child.count_statuses(counts);
@@ -97,7 +113,7 @@ impl MainTaskPane {
         Self {
             id: Uuid::new_v4().to_string(),
             title: title.to_string(),
-            status: TaskStatus::Default,
+            status: TaskStatus::Active,
             subtasks: Vec::new(),
         }
     }
@@ -105,10 +121,9 @@ impl MainTaskPane {
     pub fn count_statuses(&self, counts: &mut StatusCounts) {
         counts.total += 1;
         match self.status {
-            TaskStatus::Default => counts.default_count += 1,
-            TaskStatus::Yellow => counts.yellow_count += 1,
-            TaskStatus::Green => counts.green_count += 1,
-            TaskStatus::Red => counts.red_count += 1,
+            TaskStatus::Active => counts.active_count += 1,
+            TaskStatus::Completed => counts.completed_count += 1,
+            TaskStatus::Cancelled => counts.cancelled_count += 1,
         }
         for sub in &self.subtasks {
             sub.count_statuses(counts);
@@ -127,48 +142,12 @@ impl Default for DayBoard {
     fn default() -> Self {
         let now = chrono::Local::now();
         let date_iso = now.format("%Y-%m-%d").to_string();
-        let display_title = format!(
-            "{} - {} {}",
-            arabic_weekday(now.format("%A").to_string().as_str()),
-            now.format("%-d"),
-            arabic_month(now.format("%-m").to_string().as_str())
-        );
+        let display_title = now.format("%a, %b %d, %Y").to_string().to_uppercase();
         Self {
             date_iso,
             display_title,
             panes: Vec::new(),
         }
-    }
-}
-
-fn arabic_weekday(english: &str) -> &'static str {
-    match english {
-        "Monday" => "الاثنين",
-        "Tuesday" => "الثلاثاء",
-        "Wednesday" => "الأربعاء",
-        "Thursday" => "الخميس",
-        "Friday" => "الجمعة",
-        "Saturday" => "السبت",
-        "Sunday" => "الأحد",
-        _ => "اليوم",
-    }
-}
-
-fn arabic_month(month: &str) -> &'static str {
-    match month {
-        "1" => "كانون الثاني",
-        "2" => "شباط",
-        "3" => "آذار",
-        "4" => "نيسان",
-        "5" => "أيار",
-        "6" => "حزيران",
-        "7" => "تموز",
-        "8" => "آب",
-        "9" => "أيلول",
-        "10" => "تشرين الأول",
-        "11" => "تشرين الثاني",
-        "12" => "كانون الأول",
-        _ => "الشهر الحالي",
     }
 }
 
@@ -200,7 +179,7 @@ pub struct MonthBoard {
 impl Default for MonthBoard {
     fn default() -> Self {
         Self {
-            month_label: "الشهر الحالي".to_string(),
+            month_label: "CURRENT MONTH".to_string(),
             goals: [String::new(), String::new(), String::new(), String::new()],
             weeks: vec![
                 WeekBoard {
@@ -226,22 +205,37 @@ impl Default for MonthBoard {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StatusCounts {
-    pub default_count: usize,
-    pub yellow_count: usize,
-    pub green_count: usize,
-    pub red_count: usize,
+    /// Completed tasks.
+    #[serde(rename = "completed_count", alias = "green_count", default)]
+    pub completed_count: usize,
+    /// Active (in progress) tasks.
+    #[serde(rename = "active_count", alias = "yellow_count", default)]
+    pub active_count: usize,
+    /// Cancelled tasks.
+    #[serde(rename = "cancelled_count", alias = "red_count", default)]
+    pub cancelled_count: usize,
+    #[serde(default)]
     pub total: usize,
+    /// Legacy "planned" counter, kept only so older data files still load.
+    #[serde(
+        rename = "legacy_planned",
+        alias = "default_count",
+        default,
+        skip_serializing
+    )]
+    #[allow(dead_code)]
+    pub legacy_planned: usize,
 }
 
 impl StatusCounts {
-    /// Completion % = Green / (Total - Red) * 100
-    /// Excludes Red (cancelled) items from failure denominator.
+    /// Completion % = completed / (total - cancelled) * 100.
+    /// Cancelled items are excluded from the denominator.
     pub fn completion_rate(&self) -> f32 {
-        let denominator = self.total.saturating_sub(self.red_count);
+        let denominator = self.total.saturating_sub(self.cancelled_count);
         if denominator == 0 {
             0.0
         } else {
-            (self.green_count as f32 / denominator as f32) * 100.0
+            (self.completed_count as f32 / denominator as f32) * 100.0
         }
     }
 }
@@ -270,11 +264,11 @@ pub struct AppData {
 mod tests {
     use super::*;
 
-    fn counts(total: usize, green: usize, red: usize) -> StatusCounts {
+    fn counts(total: usize, completed: usize, cancelled: usize) -> StatusCounts {
         StatusCounts {
             total,
-            green_count: green,
-            red_count: red,
+            completed_count: completed,
+            cancelled_count: cancelled,
             ..Default::default()
         }
     }
@@ -293,11 +287,11 @@ mod tests {
     #[test]
     fn node_counts_include_children() {
         let mut pane = MainTaskPane::new("Main");
-        pane.status = TaskStatus::Green;
+        pane.status = TaskStatus::Completed;
         let mut child = TaskNode::new("Child");
-        child.status = TaskStatus::Yellow;
+        child.status = TaskStatus::Active;
         let mut grandchild = TaskNode::new("Grandchild");
-        grandchild.status = TaskStatus::Red;
+        grandchild.status = TaskStatus::Cancelled;
         child.children.push(grandchild);
         pane.subtasks.push(child);
         pane.subtasks.push(TaskNode::new("Sibling"));
@@ -305,10 +299,10 @@ mod tests {
         let mut c = StatusCounts::default();
         pane.count_statuses(&mut c);
         assert_eq!(c.total, 4);
-        assert_eq!(c.green_count, 1);
-        assert_eq!(c.yellow_count, 1);
-        assert_eq!(c.red_count, 1);
-        assert_eq!(c.default_count, 1);
+        assert_eq!(c.completed_count, 1);
+        // The pane's second child stays active by default.
+        assert_eq!(c.active_count, 2);
+        assert_eq!(c.cancelled_count, 1);
     }
 
     #[test]
@@ -318,5 +312,31 @@ mod tests {
         let back: DayBoard = serde_json::from_str(&json).unwrap();
         assert_eq!(day.date_iso, back.date_iso);
         assert_eq!(day.display_title, back.display_title);
+    }
+
+    #[test]
+    fn legacy_task_node_deserializes_with_default_notes_and_collapsed() {
+        let legacy_json = r#"{
+            "id": "n-1",
+            "title": "مهمة قديمة",
+            "status": "Active",
+            "children": []
+        }"#;
+        let node: TaskNode = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(node.notes, "");
+        assert!(node.attachments.is_empty());
+        assert!(!node.collapsed);
+        assert!(!node.is_folded());
+    }
+
+    #[test]
+    fn descendant_count_includes_all_nested_levels() {
+        let mut root = TaskNode::new("root");
+        let mut child = TaskNode::new("child");
+        child.children.push(TaskNode::new("grandchild 1"));
+        child.children.push(TaskNode::new("grandchild 2"));
+        root.children.push(child);
+        root.children.push(TaskNode::new("sibling"));
+        assert_eq!(root.descendant_count(), 4);
     }
 }

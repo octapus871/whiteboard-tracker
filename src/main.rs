@@ -11,9 +11,11 @@ use storage::load_app_data;
 fn main() -> eframe::Result<()> {
     let native_options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("السبورة الذكية - Whiteboard Tracker")
+            .with_title("Whiteboard Tracker")
             .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([800.0, 600.0]),
+            .with_min_inner_size([800.0, 600.0])
+            // Frameless: the 32px app bar is the true top edge of the window.
+            .with_decorations(false),
         ..Default::default()
     };
 
