@@ -45,6 +45,9 @@ pub const DRAWER_BG: Color32 = Color32::from_rgb(0xF8, 0xFA, 0xFC);
 /// Faint placeholder/hint color for empty inputs.
 pub const HINT: Color32 = Color32::from_rgb(0xCB, 0xD5, 0xE1);
 
+/// Subtle light slate rule (#E2E8F0) for pane column splits and bottom input strip border.
+pub const SUBTLE_RULE: Color32 = Color32::from_rgb(0xE2, 0xE8, 0xF0);
+
 pub const CARD_RADIUS: u8 = 0;
 /// Thickness of the black tiling grid lines.
 pub const GRID_LINE: f32 = 2.0;
