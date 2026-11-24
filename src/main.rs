@@ -11,6 +11,16 @@ use eframe::NativeOptions;
 use storage::load_app_data;
 
 fn main() -> eframe::Result<()> {
+    match storage::parse_data_dir_arg(std::env::args_os()) {
+        Ok(Some(dir)) => storage::set_data_dir_override(Some(dir)),
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("Error: {err}");
+            eprintln!("Usage: whiteboard_tracker [--data-dir <PATH>]");
+            std::process::exit(2);
+        }
+    }
+
     let native_options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Whiteboard Tracker")

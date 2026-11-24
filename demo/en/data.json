@@ -1,0 +1,523 @@
+{
+  "current_day": {
+    "date_iso": "2026-11-23",
+    "panes": [
+      {
+        "id": "demo-y-pane-1",
+        "title": "Write user documentation",
+        "status": "Active",
+        "subtasks": [
+          {
+            "id": "demo-y-p1-n1",
+            "title": "Document CLI flags",
+            "status": "Completed",
+            "notes": "",
+            "collapsed": false,
+            "children": []
+          },
+          {
+            "id": "demo-y-p1-n2",
+            "title": "Add troubleshooting FAQ",
+            "status": "Active",
+            "notes": "",
+            "collapsed": false,
+            "children": []
+          },
+          {
+            "id": "demo-y-p1-n3",
+            "title": "Review quick-start steps",
+            "status": "Active",
+            "notes": "",
+            "collapsed": false,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "demo-y-pane-2",
+        "title": "Organize project backlog",
+        "status": "Active",
+        "subtasks": [
+          {
+            "id": "demo-y-p2-n1",
+            "title": "Triage open issues",
+            "status": "Completed",
+            "notes": "",
+            "collapsed": false,
+            "children": []
+          },
+          {
+            "id": "demo-y-p2-n2",
+            "title": "Label good first issues",
+            "status": "Active",
+            "notes": "okay , for all team to >>>>>>> ",
+            "collapsed": false,
+            "children": []
+          },
+          {
+            "id": "demo-y-p2-n3",
+            "title": "Archive outdated RFC",
+            "status": "Cancelled",
+            "notes": "",
+            "collapsed": false,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "8427442c-25f4-49fd-99be-730c69335710",
+        "title": "one",
+        "status": "Active",
+        "subtasks": []
+      },
+      {
+        "id": "89e80e3f-7fb0-4b2a-9e57-c67bb5451f7b",
+        "title": "three",
+        "status": "Active",
+        "subtasks": []
+      },
+      {
+        "id": "31a526e2-7538-40d1-9b4f-b9534e9099fc",
+        "title": "six",
+        "status": "Active",
+        "subtasks": []
+      }
+    ]
+  },
+  "archived_panes": [
+    {
+      "id": "demo-arch-1",
+      "title": "Configure CI workflow",
+      "status": "Completed",
+      "subtasks": [
+        {
+          "id": "demo-arch-1-n1",
+          "title": "Run cargo test on pull requests",
+          "status": "Completed",
+          "notes": "",
+          "collapsed": false,
+          "children": []
+        },
+        {
+          "id": "demo-arch-1-n2",
+          "title": "Upload cross-platform release artifacts",
+          "status": "Completed",
+          "notes": "",
+          "collapsed": false,
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "demo-arch-2",
+      "title": "Update issue templates",
+      "status": "Completed",
+      "subtasks": [
+        {
+          "id": "demo-arch-2-n1",
+          "title": "Add bug report checklist",
+          "status": "Completed",
+          "notes": "",
+          "collapsed": false,
+          "children": []
+        },
+        {
+          "id": "demo-arch-2-n2",
+          "title": "Keep legacy email form",
+          "status": "Cancelled",
+          "notes": "",
+          "collapsed": false,
+          "children": []
+        }
+      ]
+    }
+  ],
+  "profiles": [
+    {
+      "id": "demo-profile-today",
+      "date_str": "2026-11-24",
+      "title": "Tuesday — Today's Tasks",
+      "created_ts": 1795521600,
+      "panes": [
+        {
+          "id": "demo-pane-1",
+          "title": "Launch the app",
+          "status": "Active",
+          "subtasks": [
+            {
+              "id": "demo-p1-n1",
+              "title": "Release checklist",
+              "status": "Active",
+              "notes": "",
+              "collapsed": false,
+              "children": [
+                {
+                  "id": "demo-p1-n2",
+                  "title": "Build release binaries",
+                  "status": "Completed",
+                  "notes": "",
+                  "collapsed": false,
+                  "children": [
+                    {
+                      "id": "demo-p1-n3",
+                      "title": "Test Linux and Windows archives",
+                      "status": "Completed",
+                      "notes": "Verified clean startup on Fedora 41 and Windows 11.\nConfirmed bundled NotoSansArabic fallback renders offline.",
+                      "collapsed": false,
+                      "children": []
+                    },
+                    {
+                      "id": "demo-p1-n4",
+                      "title": "Verify SHA-256 checksums",
+                      "status": "Completed",
+                      "notes": "",
+                      "collapsed": false,
+                      "children": []
+                    }
+                  ]
+                },
+                {
+                  "id": "demo-p1-n5",
+                  "title": "Publish release notes",
+                  "status": "Active",
+                  "notes": "",
+                  "collapsed": false,
+                  "children": [
+                    {
+                      "id": "demo-p1-n6",
+                      "title": "Add screenshots to README",
+                      "status": "Active",
+                      "notes": "",
+                      "collapsed": false,
+                      "children": []
+                    },
+                    {
+                      "id": "demo-p1-n7",
+                      "title": "Tag v1.0.0 on GitHub",
+                      "status": "Active",
+                      "notes": "",
+                      "collapsed": false,
+                      "children": []
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "id": "demo-p1-n8",
+              "title": "Launch announcement",
+              "status": "Active",
+              "notes": "",
+              "collapsed": false,
+              "children": [
+                {
+                  "id": "demo-p1-n9",
+                  "title": "Write short walkthrough post",
+                  "status": "Active",
+                  "notes": "",
+                  "collapsed": false,
+                  "children": []
+                },
+                {
+                  "id": "demo-p1-n10",
+                  "title": "Record long promo video",
+                  "status": "Cancelled",
+                  "notes": "",
+                  "collapsed": false,
+                  "children": []
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "demo-pane-2",
+          "title": "Prepare weekly meeting",
+          "status": "Active",
+          "subtasks": [
+            {
+              "id": "demo-p2-n1",
+              "title": "Team status updates",
+              "status": "Active",
+              "notes": "",
+              "collapsed": true,
+              "children": [
+                {
+                  "id": "demo-p2-n2",
+                  "title": "Frontend sprint milestones",
+                  "status": "Completed",
+                  "notes": "",
+                  "collapsed": false,
+                  "children": []
+                },
+                {
+                  "id": "demo-p2-n3",
+                  "title": "Open bug triage summary",
+                  "status": "Completed",
+                  "notes": "",
+                  "collapsed": false,
+                  "children": []
+                },
+                {
+                  "id": "demo-p2-n4",
+                  "title": "Confirm QA sign-off",
+                  "status": "Active",
+                  "notes": "",
+                  "collapsed": false,
+                  "children": []
+                }
+              ]
+            },
+            {
+              "id": "demo-p2-n5",
+              "title": "Presentation deck",
+              "status": "Active",
+              "notes": "Keep the walkthrough under 10 minutes:\n- 2 min metrics recap\n- 5 min Q4 priorities\n- 3 min open questions",
+              "collapsed": false,
+              "children": [
+                {
+                  "id": "demo-p2-n6",
+                  "title": "Update Q4 roadmap chart",
+                  "status": "Completed",
+                  "notes": "",
+                  "collapsed": false,
+                  "children": []
+                },
+                {
+                  "id": "demo-p2-n7",
+                  "title": "Remove legacy metrics slide",
+                  "status": "Cancelled",
+                  "notes": "",
+                  "collapsed": false,
+                  "children": []
+                },
+                {
+                  "id": "demo-p2-n8",
+                  "title": "Share agenda link before call",
+                  "status": "Active",
+                  "notes": "",
+                  "collapsed": false,
+                  "children": []
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "demo-pane-4",
+          "title": "Home renovation",
+          "status": "Active",
+          "subtasks": [
+            {
+              "id": "demo-p4-n1",
+              "title": "Compare hallway paint swatches",
+              "status": "Completed",
+              "notes": "",
+              "collapsed": true,
+              "children": [
+                {
+                  "id": "4d3d3688-62f4-40ca-bb68-5b1848232860",
+                  "title": "first try ",
+                  "status": "Cancelled",
+                  "notes": "",
+                  "collapsed": false,
+                  "children": []
+                },
+                {
+                  "id": "6a8e2cf4-8719-4731-91f9-b48dba1a5298",
+                  "title": "second try",
+                  "status": "Completed",
+                  "notes": "",
+                  "collapsed": false,
+                  "children": []
+                }
+              ]
+            },
+            {
+              "id": "demo-p4-n2",
+              "title": "Order kitchen cabinet handles",
+              "status": "Completed",
+              "notes": "",
+              "collapsed": false,
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "cbbca4b1-050e-489f-b350-db3cb4fd1f36",
+          "title": "Write info file",
+          "status": "Active",
+          "subtasks": []
+        },
+        {
+          "id": "9210c479-0e40-48b4-ae95-399fcaf651b9",
+          "title": "Take Notes about Book",
+          "status": "Active",
+          "subtasks": []
+        },
+        {
+          "id": "demo-pane-3",
+          "title": "Learn Rust",
+          "status": "Active",
+          "subtasks": [
+            {
+              "id": "demo-p3-n1",
+              "title": "Ownership & lifetimes",
+              "status": "Completed",
+              "notes": "alreday done",
+              "collapsed": true,
+              "children": [
+                {
+                  "id": "demo-p3-n2",
+                  "title": "Borrow checker exercises",
+                  "status": "Completed",
+                  "notes": "",
+                  "collapsed": false,
+                  "children": []
+                },
+                {
+                  "id": "demo-p3-n3",
+                  "title": "Slices and string types",
+                  "status": "Completed",
+                  "notes": "",
+                  "collapsed": false,
+                  "children": []
+                },
+                {
+                  "id": "demo-p3-n4",
+                  "title": "Generic lifetime bounds",
+                  "status": "Completed",
+                  "notes": "",
+                  "collapsed": false,
+                  "children": []
+                }
+              ]
+            },
+            {
+              "id": "demo-p3-n5",
+              "title": "Error handling",
+              "status": "Active",
+              "notes": "",
+              "collapsed": false,
+              "children": [
+                {
+                  "id": "demo-p3-n6",
+                  "title": "Practice Result and ? operator",
+                  "status": "Completed",
+                  "notes": "",
+                  "collapsed": false,
+                  "children": []
+                },
+                {
+                  "id": "demo-p3-n7",
+                  "title": "Design custom error enum",
+                  "status": "Active",
+                  "notes": "Implement std::fmt::Display and std::error::Error manually first, then compare with thiserror.",
+                  "collapsed": false,
+                  "children": []
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "8db3c901-366f-4fa7-932a-3f982107faf0",
+          "title": "Workout for 15min",
+          "status": "Active",
+          "subtasks": []
+        }
+      ]
+    },
+    {
+      "id": "demo-profile-yesterday",
+      "date_str": "2026-11-23",
+      "title": "Monday — Today's Tasks",
+      "created_ts": 1795435200,
+      "panes": [
+        {
+          "id": "demo-y-pane-1",
+          "title": "Write user documentation",
+          "status": "Active",
+          "subtasks": [
+            {
+              "id": "demo-y-p1-n1",
+              "title": "Document CLI flags",
+              "status": "Completed",
+              "notes": "",
+              "collapsed": false,
+              "children": []
+            },
+            {
+              "id": "demo-y-p1-n2",
+              "title": "Add troubleshooting FAQ",
+              "status": "Active",
+              "notes": "",
+              "collapsed": false,
+              "children": []
+            },
+            {
+              "id": "demo-y-p1-n3",
+              "title": "Review quick-start steps",
+              "status": "Active",
+              "notes": "",
+              "collapsed": false,
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "demo-y-pane-2",
+          "title": "Organize project backlog",
+          "status": "Active",
+          "subtasks": [
+            {
+              "id": "demo-y-p2-n1",
+              "title": "Triage open issues",
+              "status": "Completed",
+              "notes": "",
+              "collapsed": false,
+              "children": []
+            },
+            {
+              "id": "demo-y-p2-n2",
+              "title": "Label good first issues",
+              "status": "Active",
+              "notes": "okay , for all team to >>>>>>> ",
+              "collapsed": false,
+              "children": []
+            },
+            {
+              "id": "demo-y-p2-n3",
+              "title": "Archive outdated RFC",
+              "status": "Cancelled",
+              "notes": "",
+              "collapsed": false,
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "8427442c-25f4-49fd-99be-730c69335710",
+          "title": "one",
+          "status": "Active",
+          "subtasks": []
+        },
+        {
+          "id": "89e80e3f-7fb0-4b2a-9e57-c67bb5451f7b",
+          "title": "three",
+          "status": "Active",
+          "subtasks": []
+        },
+        {
+          "id": "31a526e2-7538-40d1-9b4f-b9534e9099fc",
+          "title": "six",
+          "status": "Active",
+          "subtasks": []
+        }
+      ]
+    }
+  ],
+  "active_profile_idx": 1,
+  "has_seen_onboarding": true,
+  "language": "En"
+}

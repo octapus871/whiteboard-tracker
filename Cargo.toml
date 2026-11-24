@@ -22,3 +22,22 @@ assets = [
     { source = "packaging/whiteboard_tracker.desktop", dest = "/usr/share/applications/whiteboard_tracker.desktop", mode = "644" },
     { source = "packaging/whiteboard_tracker.svg", dest = "/usr/share/icons/hicolor/scalable/apps/whiteboard_tracker.svg", mode = "644" },
 ]
+
+[package.metadata.deb]
+maintainer = "Whiteboard Tracker Contributors"
+copyright = "2026, Whiteboard Tracker Contributors"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+A fast, lightweight, local-first desktop task and mind-map tracker with a \
+Swiss-grid architectural layout, nested horizontal mind-map trees, inline notes, \
+daily profiles, and bilingual English (LTR) and Arabic (RTL) support."""
+depends = "$auto"
+recommends = "zenity | kdialog"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/whiteboard_tracker", "usr/bin/whiteboard_tracker", "755"],
+    ["packaging/whiteboard_tracker.desktop", "usr/share/applications/whiteboard_tracker.desktop", "644"],
+    ["packaging/whiteboard_tracker.svg", "usr/share/icons/hicolor/scalable/apps/whiteboard_tracker.svg", "644"],
+    ["assets/OFL.txt", "usr/share/doc/whiteboard_tracker/OFL.txt", "644"],
+]

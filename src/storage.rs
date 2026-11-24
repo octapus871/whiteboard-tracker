@@ -1,8 +1,16 @@
 use crate::models::{AppData, DayBoard, TaskNode, TaskStatus};
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::RwLock;
+
+/// Environment variable that overrides the default application data directory.
+pub const DATA_DIR_ENV_VAR: &str = "WHITEBOARD_TRACKER_DATA_DIR";
+
+/// Optional CLI override set via `--data-dir <PATH>` (takes precedence over `WHITEBOARD_TRACKER_DATA_DIR`).
+static DATA_DIR_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadError {
@@ -12,13 +20,84 @@ pub struct LoadError {
     pub backup_error: Option<String>,
 }
 
-pub fn get_data_path() -> PathBuf {
+/// Sets or clears the process-wide data directory override (typically from `--data-dir`).
+pub fn set_data_dir_override(path: Option<PathBuf>) {
+    let cleaned = path.filter(|p| !p.as_os_str().is_empty());
+    let mut guard = DATA_DIR_OVERRIDE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = cleaned;
+}
+
+/// Parses `--data-dir <PATH>` or `--data-dir=<PATH>` from CLI arguments (skipping argv[0]).
+/// Returns an error if `--data-dir` is given without a non-empty path so the app never
+/// silently falls back to the default user `data.json`.
+pub fn parse_data_dir_arg<I, S>(args: I) -> Result<Option<PathBuf>, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut iter = args.into_iter().skip(1);
+    let mut result = None;
+
+    while let Some(arg) = iter.next() {
+        let arg_os = arg.as_ref();
+        if arg_os == OsStr::new("--data-dir") {
+            let Some(val) = iter.next() else {
+                return Err("--data-dir requires a directory path".to_string());
+            };
+            let val_os = val.as_ref();
+            if val_os.is_empty() || val_os.to_string_lossy().trim().is_empty() {
+                return Err("--data-dir requires a non-empty directory path".to_string());
+            }
+            result = Some(PathBuf::from(val_os));
+        } else if let Some(arg_str) = arg_os.to_str() {
+            if let Some(rest) = arg_str.strip_prefix("--data-dir=") {
+                if rest.trim().is_empty() {
+                    return Err("--data-dir= requires a non-empty directory path".to_string());
+                }
+                result = Some(PathBuf::from(rest));
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+fn default_data_path() -> PathBuf {
     if let Some(mut path) = dirs::data_local_dir() {
         path.push("whiteboard_tracker");
         path
     } else {
         PathBuf::from(".whiteboard_tracker")
     }
+}
+
+/// Resolves the active data directory with strict precedence:
+/// 1. CLI `--data-dir` override
+/// 2. `WHITEBOARD_TRACKER_DATA_DIR` environment variable
+/// 3. OS-standard local data directory
+pub fn resolve_data_path(cli_override: Option<&Path>, env_override: Option<&OsStr>) -> PathBuf {
+    if let Some(cli) = cli_override {
+        if !cli.as_os_str().is_empty() && !cli.to_string_lossy().trim().is_empty() {
+            return cli.to_path_buf();
+        }
+    }
+    if let Some(env_val) = env_override {
+        if !env_val.is_empty() && !env_val.to_string_lossy().trim().is_empty() {
+            return PathBuf::from(env_val);
+        }
+    }
+    default_data_path()
+}
+
+pub fn get_data_path() -> PathBuf {
+    let cli_override = DATA_DIR_OVERRIDE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let env_override = std::env::var_os(DATA_DIR_ENV_VAR);
+    resolve_data_path(cli_override.as_deref(), env_override.as_deref())
 }
 
 pub fn get_data_file_path() -> PathBuf {
@@ -748,5 +827,235 @@ mod tests {
         assert!(md.contains("    > Verified locally\n    > All green\n"));
         assert!(md.contains("  - [ ] Add docs\n"));
         assert!(md.contains("  - [-] ~~Legacy hook~~\n"));
+    }
+
+    #[test]
+    fn resolve_data_path_prefers_cli_over_env_over_default() {
+        let cli = PathBuf::from("/tmp/wb_cli_dir");
+        let env_val = OsStr::new("/tmp/wb_env_dir");
+
+        assert_eq!(resolve_data_path(Some(&cli), Some(env_val)), cli);
+        assert_eq!(
+            resolve_data_path(None, Some(env_val)),
+            PathBuf::from("/tmp/wb_env_dir")
+        );
+        assert_eq!(
+            resolve_data_path(Some(Path::new("")), Some(env_val)),
+            PathBuf::from("/tmp/wb_env_dir")
+        );
+        assert_eq!(
+            resolve_data_path(None, Some(OsStr::new("   "))),
+            default_data_path()
+        );
+        assert_eq!(resolve_data_path(None, None), default_data_path());
+    }
+
+    #[test]
+    fn parse_data_dir_arg_supports_separate_and_equals_forms_and_rejects_missing() {
+        assert_eq!(
+            parse_data_dir_arg(["whiteboard_tracker"]).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_data_dir_arg(["whiteboard_tracker", "--data-dir", "demo/en"]).unwrap(),
+            Some(PathBuf::from("demo/en"))
+        );
+        assert_eq!(
+            parse_data_dir_arg(["whiteboard_tracker", "--data-dir=demo/en"]).unwrap(),
+            Some(PathBuf::from("demo/en"))
+        );
+        assert!(parse_data_dir_arg(["whiteboard_tracker", "--data-dir"]).is_err());
+        assert!(parse_data_dir_arg(["whiteboard_tracker", "--data-dir", "   "]).is_err());
+        assert!(parse_data_dir_arg(["whiteboard_tracker", "--data-dir="]).is_err());
+    }
+
+    #[test]
+    fn data_dir_override_isolates_reads_writes_tmp_and_backups() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        struct EnvRestore {
+            prev_env: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                set_data_dir_override(None);
+                match &self.prev_env {
+                    Some(v) => std::env::set_var(DATA_DIR_ENV_VAR, v),
+                    None => std::env::remove_var(DATA_DIR_ENV_VAR),
+                }
+            }
+        }
+        let _guard = EnvRestore {
+            prev_env: std::env::var_os(DATA_DIR_ENV_VAR),
+        };
+
+        let env_dir = make_temp_dir("env_override");
+        let cli_dir = make_temp_dir("cli_override");
+
+        // 1. WHITEBOARD_TRACKER_DATA_DIR routes reads, writes, tmp, and backups into env_dir.
+        set_data_dir_override(None);
+        std::env::set_var(DATA_DIR_ENV_VAR, &env_dir);
+        assert_eq!(get_data_path(), env_dir);
+        assert_eq!(get_data_file_path(), env_dir.join("data.json"));
+
+        let mut env_data = AppData::default();
+        env_data
+            .current_day
+            .panes
+            .push(MainTaskPane::new("Env Scoped Pane"));
+        save_app_data(&env_data).expect("save via env override");
+        assert!(env_dir.join("data.json").exists());
+        assert!(!env_dir.join("data.tmp").exists());
+
+        let loaded_env = load_app_data().expect("load via env override");
+        assert_eq!(loaded_env.current_day.panes.len(), 1);
+        assert_eq!(loaded_env.current_day.panes[0].title, "Env Scoped Pane");
+
+        let env_bak = backup_current_app_data(&env_data).expect("backup via env override");
+        assert_eq!(env_bak.parent(), Some(env_dir.as_path()));
+
+        // Corrupt env_dir/data.json and verify recovery .bak lands in env_dir.
+        fs::write(env_dir.join("data.json"), "{ invalid").expect("corrupt env data.json");
+        let err = load_app_data().expect_err("corrupt env data.json must fail");
+        assert_eq!(err.file_path, env_dir.join("data.json"));
+        let corrupt_bak = err.backup_path.expect("corrupt backup path");
+        assert_eq!(corrupt_bak.parent(), Some(env_dir.as_path()));
+
+        // 2. --data-dir CLI override takes precedence over WHITEBOARD_TRACKER_DATA_DIR and isolates cli_dir.
+        set_data_dir_override(Some(cli_dir.clone()));
+        assert_eq!(get_data_path(), cli_dir);
+        assert_eq!(get_data_file_path(), cli_dir.join("data.json"));
+
+        let mut cli_data = AppData::default();
+        cli_data
+            .current_day
+            .panes
+            .push(MainTaskPane::new("CLI Scoped Pane"));
+        save_app_data(&cli_data).expect("save via CLI override");
+        assert!(cli_dir.join("data.json").exists());
+        assert!(!cli_dir.join("data.tmp").exists());
+
+        let loaded_cli = load_app_data().expect("load via CLI override");
+        assert_eq!(loaded_cli.current_day.panes.len(), 1);
+        assert_eq!(loaded_cli.current_day.panes[0].title, "CLI Scoped Pane");
+
+        let cli_bak = backup_current_app_data(&cli_data).expect("backup via CLI override");
+        assert_eq!(cli_bak.parent(), Some(cli_dir.as_path()));
+
+        // Verify env_dir/data.json was untouched by the CLI override save.
+        assert_eq!(
+            fs::read_to_string(env_dir.join("data.json")).unwrap(),
+            "{ invalid"
+        );
+
+        let _ = fs::remove_dir_all(&env_dir);
+        let _ = fs::remove_dir_all(&cli_dir);
+    }
+
+    #[test]
+    fn demo_en_data_json_loads_cleanly_and_meets_screenshot_spec() {
+        use crate::models::AppLang;
+
+        fn count_nodes(nodes: &[TaskNode]) -> usize {
+            nodes.iter().map(|n| 1 + count_nodes(&n.children)).sum()
+        }
+        fn max_depth(nodes: &[TaskNode]) -> usize {
+            nodes
+                .iter()
+                .map(|n| 1 + max_depth(&n.children))
+                .max()
+                .unwrap_or(0)
+        }
+        fn collect_stats(
+            nodes: &[TaskNode],
+            statuses: &mut Vec<TaskStatus>,
+            notes_count: &mut usize,
+            has_folded: &mut bool,
+            has_completed_group: &mut bool,
+        ) {
+            for n in nodes {
+                statuses.push(n.status);
+                if !n.notes.trim().is_empty() {
+                    *notes_count += 1;
+                }
+                if n.collapsed && !n.children.is_empty() {
+                    *has_folded = true;
+                }
+                if n.status == TaskStatus::Completed && n.all_children_completed() {
+                    *has_completed_group = true;
+                }
+                collect_stats(
+                    &n.children,
+                    statuses,
+                    notes_count,
+                    has_folded,
+                    has_completed_group,
+                );
+            }
+        }
+
+        let demo_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("demo/en/data.json");
+        let data = load_app_data_from_path(&demo_path)
+            .expect("demo/en/data.json must deserialize cleanly into AppData");
+
+        assert_eq!(data.language, Some(AppLang::En));
+        assert!(data.has_seen_onboarding);
+        assert_eq!(data.profiles.len(), 2);
+        assert_eq!(data.active_profile_idx, 0);
+        assert!(data.profiles[0].created_ts > data.profiles[1].created_ts);
+
+        let today = &data.profiles[0];
+        let titles: Vec<&str> = today.panes.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "Launch the app",
+                "Prepare weekly meeting",
+                "Learn Rust",
+                "Home renovation"
+            ]
+        );
+        assert_eq!(data.current_day.panes.len(), 4);
+
+        // Pane 0: 3 levels of depth and 8-10 nodes.
+        let p0_nodes = count_nodes(&today.panes[0].subtasks);
+        assert!((8..=10).contains(&p0_nodes), "expected 8-10 nodes, got {p0_nodes}");
+        assert_eq!(max_depth(&today.panes[0].subtasks), 3);
+
+        // Pane 3: nearly empty (1-2 nodes).
+        assert!(count_nodes(&today.panes[3].subtasks) <= 2);
+
+        // Mixed statuses, 2-3 notes, folded branch, and fully completed group.
+        let mut statuses = Vec::new();
+        let mut notes_count = 0usize;
+        let mut has_folded = false;
+        let mut has_completed_group = false;
+        for pane in &today.panes {
+            collect_stats(
+                &pane.subtasks,
+                &mut statuses,
+                &mut notes_count,
+                &mut has_folded,
+                &mut has_completed_group,
+            );
+        }
+        assert!(statuses.contains(&TaskStatus::Active));
+        assert!(statuses.contains(&TaskStatus::Completed));
+        assert!(statuses.contains(&TaskStatus::Cancelled));
+        assert!((2..=3).contains(&notes_count), "expected 2-3 notes, got {notes_count}");
+        assert!(has_folded, "expected at least one folded branch with children");
+        assert!(has_completed_group, "expected at least one fully completed group");
+
+        // Yesterday profile has unfinished active panes for carry-over.
+        let yesterday = &data.profiles[1];
+        assert!(
+            yesterday
+                .panes
+                .iter()
+                .any(|p| p.clone_active_only().is_some()),
+            "yesterday must have unfinished active tasks to carry over"
+        );
     }
 }
