@@ -6,15 +6,31 @@ A fast, lightweight, local-first desktop task and mind-map tracker built in Rust
 
 ## Screenshots
 
-> Screenshots coming soon — place images under [`docs/screenshots/`](docs/screenshots/).
+<p align="center">
+  <img src="docs/screenshots/demo-preview.gif" alt="Whiteboard Tracker animated preview showing Focus Mode, status cycling, and the inline Note Drawer" width="800" />
+  <br />
+  <a href="docs/screenshots/demo.mp4"><strong>Watch the full demo (1:40)</strong></a>
+</p>
 
-| English (LTR) Board | Arabic (RTL) Board |
-| :---: | :---: |
-| ![English Board](docs/screenshots/board-en.png) | ![Arabic Board](docs/screenshots/board-ar.png) |
+### Daily Whiteboard Overview
 
-| Embedded Note Drawer | Master Index |
+![Whiteboard Tracker 4-pane Swiss-grid home board with nested mind-map trees, folded branch badge, and progress bar](docs/screenshots/home-board.png)
+*Paginated 4-pane Swiss-grid workspace (`HOME`) with multi-level mind-map trees, folded branches (`+3`), status shadows, dog-ear note indicators, and live progress metrics.*
+
+| Focus Mode | Quick Task Entry |
 | :---: | :---: |
-| ![Note Drawer](docs/screenshots/note-drawer.png) | ![Master Index](docs/screenshots/master-index.png) |
+| ![Focus Mode maximizing a single task pane with a 3-level mind-map tree](docs/screenshots/focus-mode.png) | ![Quick Task Entry modal with staged tasks ready to create board panes](docs/screenshots/quick-entry.png) |
+| *Maximize any single pane to full screen (`1`–`9` or click header; `Esc` to return).* | *Rapidly stage multiple main tasks (`Ctrl+N`) before generating panes on the board.* |
+
+| Master Index | Daily Profiles & Carry-Over |
+| :---: | :---: |
+| ![Master Index view showing page grouping, pane reordering, archive, and delete confirmation](docs/screenshots/master-index.png) | ![Daily Profiles modal showing today and yesterday boards with Carry Over Active](docs/screenshots/daily-profiles.png) |
+| *Reorder panes across pages, inline-rename, archive, or delete with two-click confirmation.* | *Switch between chronological daily boards and carry over unfinished active tasks.* |
+
+### Multi-Page Pagination
+
+![Second page of the paginated whiteboard showing newly added panes in a 3-pane master-and-stack layout](docs/screenshots/paginated-pages.png)
+*Boards automatically paginate at 4 panes per page with instant keyboard navigation (`PageUp` / `PageDown`, `Alt+←` / `Alt+→`).*
 
 ---
 
