@@ -1,6 +1,8 @@
 [package]
 name = "whiteboard_tracker"
 version = "0.1.0"
+description = "Swiss-grid visual task & mind-map desktop tracker"
+license = "MIT"
 edition = "2021"
 
 [dependencies]
@@ -13,3 +15,10 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "6.0"
 arabic_reshaper = "0.4.2"
 unicode-bidi = "0.3"
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/whiteboard_tracker", dest = "/usr/bin/whiteboard_tracker", mode = "755" },
+    { source = "packaging/whiteboard_tracker.desktop", dest = "/usr/share/applications/whiteboard_tracker.desktop", mode = "644" },
+    { source = "packaging/whiteboard_tracker.svg", dest = "/usr/share/icons/hicolor/scalable/apps/whiteboard_tracker.svg", mode = "644" },
+]

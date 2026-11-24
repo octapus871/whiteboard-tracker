@@ -17,14 +17,6 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
-    pub fn label_en(&self) -> &'static str {
-        match self {
-            TaskStatus::Active => "Active",
-            TaskStatus::Completed => "Completed",
-            TaskStatus::Cancelled => "Cancelled",
-        }
-    }
-
     /// Cycles through the three states:
     /// active → completed → cancelled → active.
     pub fn next(self) -> Self {
@@ -36,37 +28,22 @@ impl TaskStatus {
     }
 }
 
-/// Subtle monochrome geometric watermark stamp placed in a card's bottom-left
-/// interior corner (`22×22px` bounds, `4px` inset).
+/// Active UI language (`Ar` = Arabic RTL, `En` = English LTR).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CardStamp {
-    Dog,
-    Cat,
-    Duck,
-    Bird,
-    Star,
+pub enum AppLang {
+    Ar,
+    En,
 }
 
-impl CardStamp {
-    /// Cycles through `None -> Dog -> Cat -> Duck -> Bird -> Star -> None`.
-    pub fn next_option(current: Option<Self>) -> Option<Self> {
-        match current {
-            None => Some(Self::Dog),
-            Some(Self::Dog) => Some(Self::Cat),
-            Some(Self::Cat) => Some(Self::Duck),
-            Some(Self::Duck) => Some(Self::Bird),
-            Some(Self::Bird) => Some(Self::Star),
-            Some(Self::Star) => None,
-        }
+impl AppLang {
+    pub fn is_rtl(self) -> bool {
+        matches!(self, Self::Ar)
     }
 
-    pub fn label_en(self) -> &'static str {
+    pub fn toggle(self) -> Self {
         match self {
-            Self::Dog => "DOG",
-            Self::Cat => "CAT",
-            Self::Duck => "DUCK",
-            Self::Bird => "BIRD",
-            Self::Star => "STAR",
+            Self::Ar => Self::En,
+            Self::En => Self::Ar,
         }
     }
 }
@@ -75,6 +52,7 @@ impl CardStamp {
 /// what powers the `Enter` (sibling) / `Tab` (child) / `Shift+Tab` (outdent)
 /// outlining workflow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "TaskNodeWire")]
 pub struct TaskNode {
     pub id: String,
     pub title: String,
@@ -82,19 +60,40 @@ pub struct TaskNode {
     #[serde(default)]
     pub notes: String,
     #[serde(default)]
-    pub attachments: Vec<String>,
-    #[serde(default)]
     pub collapsed: bool,
     #[serde(default)]
-    pub stamp: Option<CardStamp>,
-    #[serde(default)]
     pub children: Vec<TaskNode>,
-    #[serde(default = "default_expanded")]
-    pub is_expanded: bool,
 }
 
-fn default_expanded() -> bool {
-    true
+/// Deserialization wire format that transparently migrates legacy `is_expanded`
+/// (and/or `collapsed`) fields from older `data.json` files into a single `collapsed` bool.
+#[derive(Deserialize)]
+struct TaskNodeWire {
+    id: String,
+    title: String,
+    status: TaskStatus,
+    #[serde(default)]
+    notes: String,
+    #[serde(default)]
+    collapsed: Option<bool>,
+    #[serde(default)]
+    is_expanded: Option<bool>,
+    #[serde(default)]
+    children: Vec<TaskNode>,
+}
+
+impl From<TaskNodeWire> for TaskNode {
+    fn from(raw: TaskNodeWire) -> Self {
+        let collapsed = raw.collapsed.unwrap_or(false) || !raw.is_expanded.unwrap_or(true);
+        Self {
+            id: raw.id,
+            title: raw.title,
+            status: raw.status,
+            notes: raw.notes,
+            collapsed,
+            children: raw.children,
+        }
+    }
 }
 
 impl TaskNode {
@@ -104,11 +103,8 @@ impl TaskNode {
             title: title.to_string(),
             status: TaskStatus::Active,
             notes: String::new(),
-            attachments: Vec::new(),
             collapsed: false,
-            stamp: None,
             children: Vec::new(),
-            is_expanded: true,
         }
     }
 
@@ -128,17 +124,14 @@ impl TaskNode {
             title: self.title.clone(),
             status: TaskStatus::Active,
             notes: self.notes.clone(),
-            attachments: self.attachments.clone(),
             collapsed: self.collapsed,
-            stamp: self.stamp,
             children: active_children,
-            is_expanded: self.is_expanded,
         })
     }
 
     /// True when this node's child branches are visually folded.
     pub fn is_folded(&self) -> bool {
-        self.collapsed || !self.is_expanded
+        self.collapsed
     }
 
     /// Total number of descendant nodes hidden beneath this node.
@@ -158,15 +151,20 @@ impl TaskNode {
             })
     }
 
+    /// Accumulates leaf-only task counts into `counts`.
+    /// Non-leaf parent nodes delegate to their children so tasks are never double-counted.
     pub fn count_statuses(&self, counts: &mut StatusCounts) {
-        counts.total += 1;
-        match self.status {
-            TaskStatus::Active => counts.active_count += 1,
-            TaskStatus::Completed => counts.completed_count += 1,
-            TaskStatus::Cancelled => counts.cancelled_count += 1,
-        }
-        for child in &self.children {
-            child.count_statuses(counts);
+        if self.children.is_empty() {
+            counts.total += 1;
+            match self.status {
+                TaskStatus::Active => counts.active_count += 1,
+                TaskStatus::Completed => counts.completed_count += 1,
+                TaskStatus::Cancelled => counts.cancelled_count += 1,
+            }
+        } else {
+            for child in &self.children {
+                child.count_statuses(counts);
+            }
         }
     }
 }
@@ -213,23 +211,25 @@ impl MainTaskPane {
         })
     }
 
+    /// Accumulates leaf-only subtask counts for this pane (the pane container itself is not counted).
     pub fn count_statuses(&self, counts: &mut StatusCounts) {
-        counts.total += 1;
-        match self.status {
-            TaskStatus::Active => counts.active_count += 1,
-            TaskStatus::Completed => counts.completed_count += 1,
-            TaskStatus::Cancelled => counts.cancelled_count += 1,
-        }
         for sub in &self.subtasks {
             sub.count_statuses(counts);
         }
+    }
+
+    /// Returns `(completed_leaves, actionable_leaves)` where cancelled leaves are excluded
+    /// from the denominator.
+    pub fn progress_counts(&self) -> (usize, usize) {
+        let mut counts = StatusCounts::default();
+        self.count_statuses(&mut counts);
+        counts.progress_counts()
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DayBoard {
     pub date_iso: String,
-    pub display_title: String,
     pub panes: Vec<MainTaskPane>,
 }
 
@@ -237,10 +237,8 @@ impl Default for DayBoard {
     fn default() -> Self {
         let now = chrono::Local::now();
         let date_iso = now.format("%Y-%m-%d").to_string();
-        let display_title = now.format("%a, %b %d, %Y").to_string().to_uppercase();
         Self {
             date_iso,
-            display_title,
             panes: Vec::new(),
         }
     }
@@ -253,48 +251,6 @@ impl DayBoard {
             pane.count_statuses(&mut counts);
         }
         counts
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct WeekBoard {
-    pub week_index: u8,
-    pub weekly_focus: String,
-    pub days: Vec<DayBoard>,
-    pub appointments: Vec<(String, String, String)>, // (day_index, time_slot, note)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MonthBoard {
-    pub month_label: String,
-    pub goals: [String; 4],
-    pub weeks: Vec<WeekBoard>,
-}
-
-impl Default for MonthBoard {
-    fn default() -> Self {
-        Self {
-            month_label: "CURRENT MONTH".to_string(),
-            goals: [String::new(), String::new(), String::new(), String::new()],
-            weeks: vec![
-                WeekBoard {
-                    week_index: 1,
-                    ..Default::default()
-                },
-                WeekBoard {
-                    week_index: 2,
-                    ..Default::default()
-                },
-                WeekBoard {
-                    week_index: 3,
-                    ..Default::default()
-                },
-                WeekBoard {
-                    week_index: 4,
-                    ..Default::default()
-                },
-            ],
-        }
     }
 }
 
@@ -323,27 +279,26 @@ pub struct StatusCounts {
 }
 
 impl StatusCounts {
+    /// Actionable leaf task count used as the progress denominator (`total - cancelled`).
+    pub fn actionable_total(&self) -> usize {
+        self.total.saturating_sub(self.cancelled_count)
+    }
+
+    /// Returns `(completed, actionable_total)` for consistent `done/total` progress display.
+    pub fn progress_counts(&self) -> (usize, usize) {
+        (self.completed_count, self.actionable_total())
+    }
+
     /// Completion % = completed / (total - cancelled) * 100.
     /// Cancelled items are excluded from the denominator.
     pub fn completion_rate(&self) -> f32 {
-        let denominator = self.total.saturating_sub(self.cancelled_count);
+        let denominator = self.actionable_total();
         if denominator == 0 {
             0.0
         } else {
             (self.completed_count as f32 / denominator as f32) * 100.0
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HarborReport {
-    pub id: String,
-    pub timestamp: String,
-    pub period_label: String,
-    pub completion_rate: f32,
-    pub counts: StatusCounts,
-    pub markdown_body: String,
-    pub user_notes: String,
 }
 
 /// A chronological daily workspace profile holding a day's panes and tasks.
@@ -373,52 +328,61 @@ impl DayProfile {
         format!("{day_ar} — مهام اليوم")
     }
 
-    pub fn new_for_today(panes: Vec<MainTaskPane>) -> Self {
+    pub fn title_for_weekday(weekday: chrono::Weekday, lang: AppLang) -> String {
+        match lang {
+            AppLang::Ar => Self::arabic_weekday_title(weekday),
+            AppLang::En => {
+                let day_en = match weekday {
+                    chrono::Weekday::Sat => "Saturday",
+                    chrono::Weekday::Sun => "Sunday",
+                    chrono::Weekday::Mon => "Monday",
+                    chrono::Weekday::Tue => "Tuesday",
+                    chrono::Weekday::Wed => "Wednesday",
+                    chrono::Weekday::Thu => "Thursday",
+                    chrono::Weekday::Fri => "Friday",
+                };
+                format!("{day_en} — Today's Tasks")
+            }
+        }
+    }
+
+    pub fn new_for_date_in_lang(
+        date: chrono::NaiveDate,
+        panes: Vec<MainTaskPane>,
+        lang: AppLang,
+    ) -> Self {
         use chrono::Datelike;
         let now = chrono::Local::now();
+        let created_ts = if date == now.date_naive() {
+            now.timestamp()
+        } else {
+            date.and_hms_opt(12, 0, 0)
+                .map(|dt| dt.and_utc().timestamp())
+                .unwrap_or_else(|| now.timestamp())
+        };
         Self {
             id: Uuid::new_v4().to_string(),
-            date_str: now.format("%Y-%m-%d").to_string(),
-            title: Self::arabic_weekday_title(now.weekday()),
-            created_ts: now.timestamp(),
+            date_str: date.format("%Y-%m-%d").to_string(),
+            title: Self::title_for_weekday(date.weekday(), lang),
+            created_ts,
             panes,
         }
     }
 
-    /// Returns `(completed_subtasks, total_subtasks)` across all panes in this profile.
+    /// Returns `(completed_leaves, actionable_leaves)` across all panes in this profile
+    /// (leaf subtasks only; cancelled subtasks excluded from the denominator).
     pub fn completion_counts(&self) -> (usize, usize) {
-        fn count_nodes(nodes: &[TaskNode]) -> (usize, usize) {
-            let mut done = 0;
-            let mut total = 0;
-            for n in nodes {
-                total += 1;
-                if n.status == TaskStatus::Completed {
-                    done += 1;
-                }
-                let (cd, ct) = count_nodes(&n.children);
-                done += cd;
-                total += ct;
-            }
-            (done, total)
-        }
-        let mut done = 0;
-        let mut total = 0;
+        let mut counts = StatusCounts::default();
         for pane in &self.panes {
-            let (pd, pt) = count_nodes(&pane.subtasks);
-            done += pd;
-            total += pt;
+            pane.count_statuses(&mut counts);
         }
-        (done, total)
+        counts.progress_counts()
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppData {
     pub current_day: DayBoard,
-    #[serde(default)]
-    pub months: Vec<MonthBoard>,
-    #[serde(default)]
-    pub harbor_reports: Vec<HarborReport>,
     #[serde(default)]
     pub archived_panes: Vec<MainTaskPane>,
     #[serde(default)]
@@ -427,6 +391,8 @@ pub struct AppData {
     pub active_profile_idx: usize,
     #[serde(default)]
     pub has_seen_onboarding: bool,
+    #[serde(default)]
+    pub language: Option<AppLang>,
 }
 
 impl AppData {
@@ -505,7 +471,8 @@ impl AppData {
         use chrono::Datelike;
         let now = chrono::Local::now();
         let today_date = now.format("%Y-%m-%d").to_string();
-        let today_title = DayProfile::arabic_weekday_title(now.weekday());
+        let lang = self.language.unwrap_or(AppLang::Ar);
+        let today_title = DayProfile::title_for_weekday(now.weekday(), lang);
         self.ensure_profiles_for_date(&today_date, now.timestamp(), today_title);
     }
 
@@ -542,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn node_counts_include_children() {
+    fn node_counts_count_only_leaf_subtasks() {
         let mut pane = MainTaskPane::new("Main");
         pane.status = TaskStatus::Completed;
         let mut child = TaskNode::new("Child");
@@ -555,11 +522,56 @@ mod tests {
 
         let mut c = StatusCounts::default();
         pane.count_statuses(&mut c);
-        assert_eq!(c.total, 4);
-        assert_eq!(c.completed_count, 1);
-        // The pane's second child stays active by default.
-        assert_eq!(c.active_count, 2);
+        // Only the 2 leaf subtasks ("Grandchild" Cancelled, "Sibling" Active) are counted;
+        // neither the pane container nor the non-leaf parent "Child" is counted.
+        assert_eq!(c.total, 2);
+        assert_eq!(c.completed_count, 0);
+        assert_eq!(c.active_count, 1);
         assert_eq!(c.cancelled_count, 1);
+        assert_eq!(c.actionable_total(), 1);
+        assert_eq!(c.progress_counts(), (0, 1));
+        assert_eq!(c.completion_rate(), 0.0);
+    }
+
+    #[test]
+    fn day_board_pane_and_profile_counts_are_unified() {
+        let mut pane1 = MainTaskPane::new("Project A");
+        let mut parent = TaskNode::new("Group");
+        parent.status = TaskStatus::Active; // non-leaf: must not be counted
+        let mut leaf_done = TaskNode::new("Done leaf");
+        leaf_done.status = TaskStatus::Completed;
+        let mut leaf_cancelled = TaskNode::new("Cancelled leaf");
+        leaf_cancelled.status = TaskStatus::Cancelled;
+        parent.children = vec![leaf_done, leaf_cancelled];
+        pane1.subtasks.push(parent);
+        pane1.subtasks.push(TaskNode::new("Active leaf"));
+
+        let empty_pane = MainTaskPane::new("Empty Pane"); // 0 leaves: must not count as 1 active
+
+        let day = DayBoard {
+            date_iso: "2026-11-23".to_string(),
+            panes: vec![pane1.clone(), empty_pane.clone()],
+        };
+        let profile = DayProfile {
+            id: "p1".to_string(),
+            date_str: "2026-11-23".to_string(),
+            title: "Monday".to_string(),
+            created_ts: 100,
+            panes: vec![pane1.clone(), empty_pane.clone()],
+        };
+
+        let day_counts = day.calculate_counts();
+        assert_eq!(day_counts.completed_count, 1);
+        assert_eq!(day_counts.active_count, 1);
+        assert_eq!(day_counts.cancelled_count, 1);
+        assert_eq!(day_counts.total, 3);
+        assert_eq!(day_counts.actionable_total(), 2);
+        assert_eq!(day_counts.completion_rate(), 50.0);
+
+        assert_eq!(pane1.progress_counts(), (1, 2));
+        assert_eq!(empty_pane.progress_counts(), (0, 0));
+        assert_eq!(profile.completion_counts(), (1, 2));
+        assert_eq!(profile.completion_counts(), day_counts.progress_counts());
     }
 
     #[test]
@@ -568,7 +580,6 @@ mod tests {
         let json = serde_json::to_string(&day).unwrap();
         let back: DayBoard = serde_json::from_str(&json).unwrap();
         assert_eq!(day.date_iso, back.date_iso);
-        assert_eq!(day.display_title, back.display_title);
     }
 
     #[test]
@@ -581,9 +592,52 @@ mod tests {
         }"#;
         let node: TaskNode = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(node.notes, "");
-        assert!(node.attachments.is_empty());
         assert!(!node.collapsed);
         assert!(!node.is_folded());
+    }
+
+    #[test]
+    fn legacy_json_with_removed_fields_and_is_expanded_loads_cleanly() {
+        let legacy_json = r#"{
+            "id": "n-stamp-1",
+            "title": "مهمة بختم قديم",
+            "status": "Active",
+            "notes": "",
+            "attachments": [],
+            "children": [
+                {
+                    "id": "n-folded",
+                    "title": "فرع مطوي",
+                    "status": "Active",
+                    "is_expanded": false
+                }
+            ],
+            "is_expanded": true,
+            "collapsed": false,
+            "stamp": "Dog"
+        }"#;
+        let node: TaskNode = serde_json::from_str(legacy_json)
+            .expect("serde must migrate legacy is_expanded and ignore removed fields cleanly");
+        assert_eq!(node.id, "n-stamp-1");
+        assert_eq!(node.title, "مهمة بختم قديم");
+        assert!(!node.collapsed);
+        assert!(
+            node.children[0].collapsed,
+            "legacy is_expanded: false must migrate to collapsed: true"
+        );
+
+        let legacy_app_json = r#"{
+            "current_day": {
+                "date_iso": "2026-11-20",
+                "display_title": "FRI, NOV 20, 2026",
+                "panes": []
+            },
+            "months": [{"month_label": "NOV", "goals": ["", "", "", ""], "weeks": []}],
+            "harbor_reports": []
+        }"#;
+        let app_data: AppData = serde_json::from_str(legacy_app_json)
+            .expect("old AppData with months, harbor_reports, and display_title must still load");
+        assert_eq!(app_data.current_day.date_iso, "2026-11-20");
     }
 
     #[test]

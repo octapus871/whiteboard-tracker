@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Whiteboard Tracker
+Comment=Swiss-grid visual task & mind-map tracker
+Exec=/usr/bin/whiteboard_tracker
+Icon=whiteboard_tracker
+Terminal=false
+Type=Application
+Categories=Office;ProjectManagement;Utility;
+StartupWMClass=whiteboard_tracker

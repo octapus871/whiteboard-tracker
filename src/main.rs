@@ -1,4 +1,6 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app;
+mod i18n;
 mod models;
 mod rtl_text;
 mod storage;
@@ -19,11 +21,14 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    let data = load_app_data();
+    let (data, load_error) = match load_app_data() {
+        Ok(data) => (data, None),
+        Err(err) => (models::AppData::default(), Some(err)),
+    };
 
     eframe::run_native(
         "Whiteboard Tracker",
         native_options,
-        Box::new(|cc| Ok(Box::new(WhiteboardApp::new(cc, data)))),
+        Box::new(|cc| Ok(Box::new(WhiteboardApp::new(cc, data, load_error)))),
     )
 }

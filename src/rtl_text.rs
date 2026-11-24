@@ -184,6 +184,143 @@ fn shape_arabic_line(line: &str) -> String {
     result
 }
 
+/// Builds the exact visual-order character mapping `(logical_char_idx, is_rtl)` for a single line,
+/// matching [`shape_arabic_line`]'s bidi run and cluster reordering 1-to-1.
+fn line_visual_map(line: &str) -> Vec<(usize, bool)> {
+    let char_count = line.chars().count();
+    if char_count == 0 {
+        return Vec::new();
+    }
+    if !contains_arabic(line) {
+        return (0..char_count).map(|i| (i, false)).collect();
+    }
+
+    let reshaped = reshaper().reshape(line);
+    if reshaped.chars().count() != char_count {
+        return (0..char_count).map(|i| (i, false)).collect();
+    }
+
+    let bidi_info = BidiInfo::new(&reshaped, Some(Level::rtl()));
+    if bidi_info.paragraphs.is_empty() {
+        return (0..char_count).map(|i| (i, false)).collect();
+    }
+
+    // Map each byte offset in `reshaped` to its character index `0..char_count`.
+    let mut byte_to_char = vec![0usize; reshaped.len() + 1];
+    for (ci, (bi, ch)) in reshaped.char_indices().enumerate() {
+        for slot in &mut byte_to_char[bi..bi + ch.len_utf8()] {
+            *slot = ci;
+        }
+    }
+    byte_to_char[reshaped.len()] = char_count;
+
+    let mut visual: Vec<(usize, bool)> = Vec::with_capacity(char_count);
+    for para in &bidi_info.paragraphs {
+        let (levels, runs) = bidi_info.visual_runs(para, para.range.clone());
+        for run in runs {
+            let start_ci = byte_to_char[run.start];
+            let slice = &reshaped[run.clone()];
+            if levels[run.start].is_rtl() {
+                let mut clusters: Vec<Vec<usize>> = Vec::new();
+                for (offset, ch) in slice.chars().enumerate() {
+                    let ci = start_ci + offset;
+                    if is_combining_mark(ch) {
+                        if let Some(last) = clusters.last_mut() {
+                            last.push(ci);
+                            continue;
+                        }
+                    }
+                    clusters.push(vec![ci]);
+                }
+                for cluster in clusters.into_iter().rev() {
+                    for ci in cluster {
+                        visual.push((ci, true));
+                    }
+                }
+            } else {
+                for (offset, _) in slice.chars().enumerate() {
+                    visual.push((start_ci + offset, false));
+                }
+            }
+        }
+    }
+
+    if visual.len() == char_count {
+        visual
+    } else {
+        (0..char_count).map(|i| (i, false)).collect()
+    }
+}
+
+/// Maps a logical character index (`0..=len`) on a single line (pure Arabic, pure Latin,
+/// or mixed Arabic/Latin) to its exact visual cursor column in the shaped galley.
+pub fn logical_to_visual_cursor_in_line(line: &str, logical_idx: usize) -> usize {
+    let visual = line_visual_map(line);
+    let len = visual.len();
+    let clamped = logical_idx.min(len);
+    if len == 0 {
+        return 0;
+    }
+
+    if clamped == 0 {
+        // Leading edge of logical char 0.
+        if let Some((vis_pos, &(_, is_rtl))) = visual.iter().enumerate().find(|(_, (l, _))| *l == 0)
+        {
+            return if is_rtl { vis_pos + 1 } else { vis_pos };
+        }
+        return len;
+    }
+
+    // Trailing edge of logical char `clamped - 1`.
+    let prev = clamped - 1;
+    if let Some((vis_pos, &(_, is_rtl))) = visual.iter().enumerate().find(|(_, (l, _))| *l == prev)
+    {
+        return if is_rtl { vis_pos } else { vis_pos + 1 };
+    }
+    clamped
+}
+
+/// Maps a visual cursor column (`0..=len`, e.g. from a mouse click in the shaped galley)
+/// back to the corresponding logical character index in `line`.
+pub fn visual_to_logical_cursor_in_line(line: &str, visual_idx: usize) -> usize {
+    let visual = line_visual_map(line);
+    let len = visual.len();
+    if len == 0 {
+        return 0;
+    }
+    let clamped = visual_idx.min(len);
+    if clamped == 0 {
+        let (log_i, is_rtl) = visual[0];
+        return if is_rtl { (log_i + 1).min(len) } else { log_i };
+    }
+    let (log_i, is_rtl) = visual[clamped - 1];
+    if is_rtl {
+        log_i
+    } else {
+        (log_i + 1).min(len)
+    }
+}
+
+/// Steps the logical cursor one visual cell left (`delta == -1`) or right (`delta == 1`)
+/// on a single line, handling pure Arabic and mixed Arabic/Latin lines cleanly.
+pub fn step_visual_cursor_in_line(line: &str, logical_idx: usize, delta: isize) -> usize {
+    let visual = line_visual_map(line);
+    let len = visual.len();
+    if len == 0 {
+        return 0;
+    }
+    let cur_vis = logical_to_visual_cursor_in_line(line, logical_idx);
+    let next_vis = if delta < 0 {
+        cur_vis.saturating_sub(delta.unsigned_abs())
+    } else {
+        (cur_vis + delta as usize).min(len)
+    };
+    if next_vis == cur_vis {
+        return logical_idx.min(len);
+    }
+    visual_to_logical_cursor_in_line(line, next_vis)
+}
+
 /// Reverses an RTL run by base+combining-mark clusters so Arabic diacritics
 /// (e.g. tanwin `ً` in `فرعاً`) stay attached to their base letter instead of
 /// jumping onto adjacent glyphs and overlapping.
@@ -363,5 +500,34 @@ mod tests {
             !shapes.is_empty(),
             "expected shaped Arabic text to produce geometry"
         );
+    }
+
+    #[test]
+    fn mixed_arabic_latin_caret_and_click_mapping_are_bidi_accurate() {
+        // Pure Arabic: "سلام" (4 chars) -> logical 0 is visual 4 (right edge), logical 4 is visual 0 (left edge).
+        let ar = "سلام";
+        assert_eq!(logical_to_visual_cursor_in_line(ar, 0), 4);
+        assert_eq!(logical_to_visual_cursor_in_line(ar, 1), 3);
+        assert_eq!(logical_to_visual_cursor_in_line(ar, 4), 0);
+        assert_eq!(visual_to_logical_cursor_in_line(ar, 4), 0);
+        assert_eq!(visual_to_logical_cursor_in_line(ar, 0), 4);
+        // Pressing ArrowRight from end (logical 4, visual 0) steps visually right to visual 1 -> logical 3.
+        assert_eq!(step_visual_cursor_in_line(ar, 4, 1), 3);
+        // Pressing ArrowLeft from logical 3 (visual 1) steps visually left to visual 0 -> logical 4.
+        assert_eq!(step_visual_cursor_in_line(ar, 3, -1), 4);
+
+        // Mixed Arabic + Latin: "مراجعة File 2" (13 chars).
+        // Visual order: "File 2" (vis 0..6, LTR) then " ةعجارم" (vis 6..13, RTL).
+        let mixed = "مراجعة File 2";
+        // Start of line (before 'م') -> far right edge (vis 13).
+        assert_eq!(logical_to_visual_cursor_in_line(mixed, 0), 13);
+        // Between 'F' (logical 7, vis 0) and 'i' (logical 8, vis 1) -> vis 1.
+        assert_eq!(logical_to_visual_cursor_in_line(mixed, 8), 1);
+        // Between 'i' and 'l' -> vis 2.
+        assert_eq!(logical_to_visual_cursor_in_line(mixed, 9), 2);
+        // Clicking at vis 1 (between 'F' and 'i') maps back to logical 8.
+        assert_eq!(visual_to_logical_cursor_in_line(mixed, 1), 8);
+        // Clicking at vis 13 (far right) maps back to logical 0.
+        assert_eq!(visual_to_logical_cursor_in_line(mixed, 13), 0);
     }
 }
